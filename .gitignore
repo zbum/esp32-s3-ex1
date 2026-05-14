@@ -1,0 +1,5 @@
+build/
+.omc/
+.claude/
+.idea/
+*.iml

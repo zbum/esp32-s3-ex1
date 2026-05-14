@@ -1,0 +1,100 @@
+// DHT22 sensor reporter for ESP32-S3 (TinyGo 0.41+).
+//
+// flash:
+//   tinygo flash -target xiao-esp32s3 \
+//     -ldflags="-X main.ssid=YourSSID -X main.password=YourPassword -X main.serverURL=http://192.168.0.10:8080/sensor" \
+//     -monitor ./
+
+package main
+
+import (
+	"fmt"
+	"log"
+	"machine"
+	"net/http"
+	"strings"
+	"time"
+
+	"esp32-s3-ex1/internal/dht"
+
+	"tinygo.org/x/drivers/netdev"
+	nl "tinygo.org/x/drivers/netlink"
+	link "tinygo.org/x/espradio/netlink"
+)
+
+var (
+	ssid      string
+	password  string
+	serverURL string = "http://192.168.0.10:8080/sensor"
+	deviceID  string = "esp32-s3-ex1"
+)
+
+const (
+	dhtPin   = machine.GPIO4
+	interval = 1 * time.Minute
+)
+
+func main() {
+	time.Sleep(2 * time.Second)
+
+	if err := connectWiFi(); err != nil {
+		log.Fatal(err)
+	}
+
+	sensor := dht.New(dhtPin, dht.DHT22)
+
+	for {
+		start := time.Now()
+
+		if err := sample(sensor); err != nil {
+			fmt.Println("sample:", err)
+		}
+
+		if remaining := interval - time.Since(start); remaining > 0 {
+			time.Sleep(remaining)
+		}
+	}
+}
+
+func connectWiFi() error {
+	l := link.Esplink{}
+	netdev.UseNetdev(&l)
+
+	fmt.Println("connecting to wifi...")
+	return l.NetConnect(&nl.ConnectParams{
+		Ssid:       ssid,
+		Passphrase: password,
+	})
+}
+
+func sample(sensor dht.Device) error {
+	if err := sensor.ReadMeasurements(); err != nil {
+		return fmt.Errorf("dht read: %w", err)
+	}
+	temp, err := sensor.TemperatureFloat(dht.C)
+	if err != nil {
+		return fmt.Errorf("temperature: %w", err)
+	}
+	hum, err := sensor.HumidityFloat()
+	if err != nil {
+		return fmt.Errorf("humidity: %w", err)
+	}
+
+	body := fmt.Sprintf(
+		`{"device":"%s","temperature":%.2f,"humidity":%.2f,"ts":%d}`,
+		deviceID, temp, hum, time.Now().Unix(),
+	)
+
+	resp, err := http.Post(serverURL, "application/json", strings.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("http post: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("server returned %d", resp.StatusCode)
+	}
+
+	fmt.Printf("sent: %.1fC %.1f%%\n", temp, hum)
+	return nil
+}
