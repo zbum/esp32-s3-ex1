@@ -1,4 +1,4 @@
-ㄹ# esp32-s3-ex1
+# esp32-s3-ex1
 
 ESP32-S3-N8R2 / N16R8 (44핀 USB-C DevKit, 8MB PSRAM) + TinyGo 예제 프로젝트. 현재 동작 모드: 온보드 RGB LED blink.
 
