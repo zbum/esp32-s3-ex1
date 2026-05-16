@@ -49,19 +49,30 @@ make monitor      PORT=/dev/cu.usbmodemXXXX
 
 ## 결선 (기본 핀)
 
-| 신호 | GPIO  | 비고 |
-|------|-------|------|
-| SCK  | GPIO12 | SPI 클럭 |
-| MOSI | GPIO11 | 데이터 출력 (SDO) |
-| DC   | GPIO10 | data / command |
-| CS   | GPIO9  | chip select |
-| RST  | GPIO8  | reset, active low |
-| BL   | GPIO7  | backlight |
-| VCC  | 3V3    | 3.3V 공급 |
-| GND  | GND    | 공통 그라운드 |
+대상 모듈은 ST7789V3 컨트롤러를 쓰는 1.69" 240x280 TFT 보드다. 브레이크
+아웃 PCB 의 핀 라벨은 보통 `BLK CS DC RES SDA SCL VCC GND` (또는 반대
+배열) 이며, 컨트롤러 데이터시트와 매핑하면 다음과 같다.
+
+![ST7789V3 1.69" 보드 핀 정의와 모듈 사진](images/st7789v3-panel.webp)
+
+| 모듈 라벨 | 데이터시트 | ESP32-S3 GPIO | 비고 |
+|-----------|------------|---------------|------|
+| SCL       | SPI clock  | GPIO12        | TinyGo `SPIConfig.SCK` |
+| SDA       | SPI MOSI   | GPIO11        | TinyGo `SPIConfig.SDO` (4선 SPI, MISO 미사용) |
+| DC        | D/C        | GPIO10        | data / command 선택 |
+| CS        | chip select| GPIO9         | active low |
+| RES       | RESET      | GPIO8         | active low (초기화) |
+| BLK       | LED cathode| GPIO7         | 백라이트 enable (PWM 가능) |
+| VCC       | LEDA+VDD   | 3V3           | 2.5V–3.3V 권장. 5V 인가 금지 |
+| GND       | GND        | GND           | 공통 그라운드 |
+
+> 일부 보드에는 `TE` (tearing-effect) 핀이 노출돼 있지만 본 데모에서는
+> 사용하지 않는다. VDDIO_1.8 라인은 모듈 PCB 내부에서 처리되며 외부
+> 결선 불필요.
 
 핀을 바꾸려면 `cmd/console/main.go` 상단의 상수만 수정한다. N16R8 모듈은
-GPIO35/36/37 이 옥탈 PSRAM 에 점유되므로 사용하지 않는다.
+GPIO35/36/37 이 옥탈 PSRAM 에 점유되므로 사용하지 않는다 — 자세한 안전
+핀 목록은 [docs/gpio-pin-mapping.md](gpio-pin-mapping.md) 참고.
 
 ## 패널 변형
 
