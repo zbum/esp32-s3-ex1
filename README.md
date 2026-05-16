@@ -119,3 +119,6 @@ make flash-console PORT=/dev/cu.usbmodemXXXX
 ```
 
 자세한 결선·API 는 [docs/st7789-console.md](docs/st7789-console.md) 참고.
+
+새 페리페럴에 GPIO 를 할당하기 전에는 [docs/gpio-pin-mapping.md](docs/gpio-pin-mapping.md)
+의 금지 핀 / 안전 핀 목록과 매핑 절차를 먼저 확인한다.
