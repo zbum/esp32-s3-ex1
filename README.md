@@ -110,3 +110,12 @@ make flash PORT=/dev/cu.usbmodemXXXX \
   SSID=YOUR_SSID PASSWORD=YOUR_PW \
   SERVER_URL=http://192.168.0.10:8080/sensor
 ```
+
+ST7789V3 텍스트 콘솔 데모 (1.69" 240x280 패널) 빌드/플래시:
+
+```bash
+make console                                       # build/console.bin 생성
+make flash-console PORT=/dev/cu.usbmodemXXXX
+```
+
+자세한 결선·API 는 [docs/st7789-console.md](docs/st7789-console.md) 참고.
