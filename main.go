@@ -1,5 +1,6 @@
-// Default sketch: cycle the on-board WS2812 through a palette and mirror every
-// status line to both the USB serial console and a 1.69" 240x280 ST7789V3 TFT.
+// Default sketch: cycle the on-board WS2812 through a palette, poll the
+// Sensirion SGP40 VOC sensor over I2C, and mirror every status line to both
+// the USB serial console and a 1.69" 240x280 ST7789V3 TFT.
 //
 // Wiring for the ST7789V3 panel (see docs/gpio-pin-mapping.md for the rules
 // behind these choices):
@@ -12,6 +13,13 @@
 //	SCL -> GPIO12  SPI clock
 //	VCC -> 3V3
 //	GND -> GND
+//
+// Wiring for the SGP40 breakout (see docs/sgp40-wiring.md):
+//
+//	SDA -> GPIO5   I2C0 data
+//	SCL -> GPIO6   I2C0 clock
+//	VCC -> 3V3
+//	GND -> GND
 package main
 
 import (
@@ -21,6 +29,7 @@ import (
 	"time"
 
 	"esp32-s3-ex1/internal/console"
+	"esp32-s3-ex1/internal/sgp40"
 	"esp32-s3-ex1/internal/ws2812"
 
 	"tinygo.org/x/drivers/st7789"
@@ -39,7 +48,11 @@ const (
 	pinRST  = machine.GPIO8
 	pinBL   = machine.GPIO7
 
+	pinSDA = machine.GPIO5
+	pinSCL = machine.GPIO6
+
 	spiFreqHz = 40_000_000
+	i2cFreqHz = 400_000
 
 	// Panel: 1.69" Waveshare ST7789V3.
 	// Visible area is 240x280 starting at GRAM row 20 inside a 240x320 GRAM.
@@ -54,7 +67,10 @@ const (
 	charAdvance = 11
 )
 
-var term *console.Console
+var (
+	term *console.Console
+	voc  *sgp40.Device
+)
 
 // say prints to USB serial via println and mirrors the same string to the
 // ST7789 console when the display has been initialized. A panel failure must
@@ -104,12 +120,37 @@ func setupDisplay() {
 	term = t
 }
 
+func setupSGP40() {
+	if err := machine.I2C0.Configure(machine.I2CConfig{
+		Frequency: i2cFreqHz,
+		SDA:       pinSDA,
+		SCL:       pinSCL,
+	}); err != nil {
+		say("i2c configure err: " + err.Error())
+		return
+	}
+
+	dev := sgp40.New(machine.I2C0)
+	if err := dev.Configure(); err != nil {
+		say("sgp40 init err: " + err.Error())
+		return
+	}
+	voc = dev
+
+	if sn, err := dev.SerialNumber(); err != nil {
+		say("sgp40 serial err: " + err.Error())
+	} else {
+		say("sgp40 serial: " + strconv.FormatUint(sn, 16))
+	}
+}
+
 func main() {
 	time.Sleep(2 * time.Second)
 
 	setupDisplay()
-	say("ST7789V3 console + WS2812 demo")
-	say("------------------------------")
+	say("ST7789V3 + WS2812 + SGP40")
+	say("-------------------------")
+	setupSGP40()
 
 	if freq, err := machine.GetCPUFrequency(); err != nil {
 		say("cpu freq err: " + err.Error())
@@ -144,6 +185,15 @@ func main() {
 			say("write err: " + err.Error())
 		} else {
 			say(strconv.Itoa(i) + ": " + names[idx])
+		}
+		// Poll the SGP40 once per second (every other palette tick) — the
+		// sensor's gas-index calibration assumes 1 Hz sampling.
+		if voc != nil && i%2 == 0 {
+			if raw, err := voc.MeasureRaw(); err != nil {
+				say("voc err: " + err.Error())
+			} else {
+				say("voc raw: " + strconv.FormatUint(uint64(raw), 10))
+			}
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
