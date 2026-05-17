@@ -41,11 +41,17 @@ const (
 
 	spiFreqHz = 40_000_000
 
-	panelWidth   = 240
-	panelHeight  = 280
-	lineHeight   = 15
-	baselineY    = 11
-	charAdvance  = 11
+	// Panel: 1.69" Waveshare ST7789V3.
+	// Visible area is 240x280 starting at GRAM row 20 inside a 240x320 GRAM.
+	panelWidth     = 240
+	panelHeight    = 280
+	panelRowOffset = 20
+	gramWidth      = 240
+	gramHeight     = 320
+
+	lineHeight  = 15
+	baselineY   = 11
+	charAdvance = 11
 )
 
 var term *console.Console
@@ -73,14 +79,17 @@ func setupDisplay() {
 	}
 
 	disp := st7789.New(bus, pinRST, pinDC, pinCS, pinBL)
+	// Tell the driver the controller's full GRAM size; the console handles
+	// the panel rowstart itself because the driver zeroes it at Rotation0.
 	disp.Configure(st7789.Config{
-		Width:  panelWidth,
-		Height: panelHeight,
+		Width:  gramWidth,
+		Height: gramHeight,
 	})
 
 	t := console.New(&disp, &freemono.Regular9pt7b, console.Config{
 		Width:       panelWidth,
 		Height:      panelHeight,
+		RowOffset:   panelRowOffset,
 		LineHeight:  lineHeight,
 		Baseline:    baselineY,
 		CharAdvance: charAdvance,

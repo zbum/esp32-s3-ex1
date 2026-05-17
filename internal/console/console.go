@@ -8,6 +8,15 @@
 // The package assumes a monospace tinyfont and a fixed line-cell height. It
 // targets the 1.69" 240x280 panel by default (RowOffset 20), but the geometry
 // is configurable for other ST7789V3 panels.
+//
+// IMPORTANT: the underlying tinygo.org/x/drivers/st7789 driver zeroes the
+// panel row offset at Rotation0. To support panels whose visible window does
+// not start at GRAM row 0 (e.g. the Waveshare 1.69" panel, where the visible
+// area is GRAM rows 20..299), configure the driver with the controller's
+// full GRAM dimensions (Width=240, Height=GRAMHeight=320) and tell the
+// console where the visible window lives via Config.RowOffset/ColOffset.
+// The console then folds those offsets into every setWindow call and into
+// the hardware scroll address so content and scroll stay in lockstep.
 package console
 
 import (
@@ -17,13 +26,27 @@ import (
 	"tinygo.org/x/tinyfont"
 )
 
-// Config captures the display geometry and the text-cell metrics derived from
-// the chosen font. All units are pixels.
+// GRAMHeight is the ST7789 controller's frame-memory height in rows. The
+// panel may show only a subset of these rows; the rest are off-screen and
+// where the scroll-area bottom-fixed-area absorbs any padding.
+const GRAMHeight = 320
+
+// Config captures the visible panel geometry, the panel's location inside
+// the ST7789 GRAM, and the text-cell metrics derived from the chosen font.
+// All units are pixels.
 //
-// Coordinates are in display-area space (0..Width, 0..Height). Any physical
-// rowstart/columnstart belongs in the st7789.Config, not here: the underlying
-// driver folds those into setWindow already, and SetScroll inside this
-// package follows the same convention so the math stays in [0, Height).
+// Width / Height describe the panel's *visible* area. RowOffset / ColOffset
+// describe where that visible area begins inside the controller's 240x320
+// GRAM:
+//
+//   - 2.0" / 1.9" 240x320 panel: Width=240 Height=320 RowOffset=0 ColOffset=0
+//   - 1.69" 240x280 panel:       Width=240 Height=280 RowOffset=20 ColOffset=0
+//   - 1.47" 172x320 panel:       Width=172 Height=320 RowOffset=0  ColOffset=34
+//
+// The companion st7789.Device must be Configure'd with the full GRAM
+// dimensions (Width=240, Height=GRAMHeight) and zero rowstart/colstart —
+// this package manages the offset itself because the driver does not at
+// Rotation0.
 //
 // Font assumptions: the package writes one monospace glyph per character cell
 // (Width / CharAdvance columns × Height / LineHeight rows). Proportional
@@ -31,6 +54,8 @@ import (
 type Config struct {
 	Width       int16 // visible width
 	Height      int16 // visible height
+	RowOffset   int16 // panel rowstart in the ST7789 GRAM (0 if the panel covers GRAM row 0)
+	ColOffset   int16 // panel colstart in the ST7789 GRAM (0 for most panels)
 	LineHeight  int16 // pixel height of one line cell (must be > 0)
 	Baseline    int16 // baseline Y within a line cell (distance from cell top)
 	CharAdvance int16 // pixels per glyph (monospace x-advance, must be > 0)
@@ -49,12 +74,16 @@ type Console struct {
 	nextLn uint32 // monotonic count of lines written since Init
 }
 
-// New builds a Console. The caller must Configure the ST7789 device first.
+// New builds a Console. The caller must Configure the ST7789 device first
+// with the full controller GRAM dimensions (typically Width=240, Height=320).
 // Init must be called before the first write. Returns nil if Config has
 // zero LineHeight, CharAdvance, Width, or Height — these would either
 // divide-by-zero or produce a zero-row console.
 func New(disp *st7789.Device, font tinyfont.Fonter, cfg Config) *Console {
 	if cfg.LineHeight <= 0 || cfg.CharAdvance <= 0 || cfg.Width <= 0 || cfg.Height <= 0 {
+		return nil
+	}
+	if cfg.RowOffset < 0 || cfg.ColOffset < 0 || cfg.RowOffset+cfg.Height > GRAMHeight {
 		return nil
 	}
 	rows := cfg.Height / cfg.LineHeight
@@ -71,19 +100,27 @@ func New(disp *st7789.Device, font tinyfont.Fonter, cfg Config) *Console {
 	}
 }
 
-// Init installs the hardware scroll region and clears the screen. The bottom
-// (Height - rows*LineHeight) pixels are reserved as a fixed background strip
-// so each line stays cell-aligned and the scroll address never straddles a
-// glyph row.
+// Init installs the hardware scroll region and clears the screen. The
+// vertical-scroll area covers GRAM rows [RowOffset, RowOffset + rows*LineHeight),
+// so any cell-aligned scroll value lands inside it without straddling the
+// VSA boundary.
 func (c *Console) Init() {
-	c.disp.SetScrollArea(0, c.cfg.Height-c.vsaH)
+	topFixed := c.cfg.RowOffset
+	bottomFixed := GRAMHeight - topFixed - c.vsaH
+	if bottomFixed < 0 {
+		bottomFixed = 0
+	}
+	c.disp.SetScrollArea(topFixed, bottomFixed)
 	c.Clear()
 }
 
-// Clear blanks the screen and resets the cursor to the first row.
+// Clear blanks the screen and resets the cursor to the first row. The fill
+// covers the visible window only — off-screen GRAM rows are left alone.
 func (c *Console) Clear() {
-	c.disp.FillScreen(c.cfg.Background)
-	c.disp.SetScroll(0)
+	if c.cfg.Height > 0 {
+		c.disp.FillRectangle(c.cfg.ColOffset, c.cfg.RowOffset, c.cfg.Width, c.cfg.Height, c.cfg.Background)
+	}
+	c.disp.SetScroll(c.cfg.RowOffset)
 	c.nextLn = 0
 }
 
@@ -146,22 +183,21 @@ func (c *Console) Write(p []byte) (int, error) {
 // is updated *before* the blit so the new row appears at the visible bottom
 // without first flashing at the top.
 //
-// SetScroll's argument is passed straight through to VSCRSADD by the driver
-// (in Rotation0). Keeping the value in display-area coordinates [0, vsaH)
-// — i.e. without the panel rowstart — matches what setWindow does when the
-// console writes pixels via FillRectangle / tinyfont.WriteLine, so content
-// and scroll address stay in lockstep.
+// Coordinates are in raw GRAM space — the driver does not add a row offset at
+// Rotation0, so the console adds RowOffset itself for both the blit position
+// and the scroll address. That keeps content and scroll register in lockstep
+// regardless of which panel variant is wired up.
 func (c *Console) writeLine(text string) {
 	rows := uint32(c.rows)
 	if c.nextLn >= rows {
 		topRing := (c.nextLn - rows + 1) % rows
-		c.disp.SetScroll(int16(int32(topRing) * int32(c.cfg.LineHeight)))
+		c.disp.SetScroll(int16(int32(c.cfg.RowOffset) + int32(topRing)*int32(c.cfg.LineHeight)))
 	}
 	ringPos := c.nextLn % rows
-	ramY := int16(int32(ringPos) * int32(c.cfg.LineHeight))
-	c.disp.FillRectangle(0, ramY, c.cfg.Width, c.cfg.LineHeight, c.cfg.Background)
+	ramY := int16(int32(c.cfg.RowOffset) + int32(ringPos)*int32(c.cfg.LineHeight))
+	c.disp.FillRectangle(c.cfg.ColOffset, ramY, c.cfg.Width, c.cfg.LineHeight, c.cfg.Background)
 	if text != "" {
-		tinyfont.WriteLine(c.disp, c.font, 0, ramY+c.cfg.Baseline, text, c.cfg.Foreground)
+		tinyfont.WriteLine(c.disp, c.font, c.cfg.ColOffset, ramY+c.cfg.Baseline, text, c.cfg.Foreground)
 	}
 	c.nextLn++
 }

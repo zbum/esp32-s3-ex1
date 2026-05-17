@@ -23,10 +23,15 @@ bus := machine.SPI0 // ESP32-S3 FSPI = 하드웨어 SPI2
 bus.Configure(machine.SPIConfig{Frequency: 40_000_000, SCK: machine.GPIO12, SDO: machine.GPIO11})
 
 disp := st7789.New(bus, machine.GPIO8, machine.GPIO10, machine.GPIO9, machine.GPIO7)
-disp.Configure(st7789.Config{Width: 240, Height: 280, RowOffset: 20})
+// 드라이버에는 **컨트롤러 GRAM 의 전체 크기(240x320)** 만 알려준다.
+// 패널 rowstart 는 console.Config 에 넣는다 — Rotation0 에서는 드라이버가
+// rowstart 를 무시하기 때문에 콘솔이 직접 보정한다.
+disp.Configure(st7789.Config{Width: 240, Height: 320})
 
 term := console.New(&disp, &freemono.Regular9pt7b, console.Config{
-    Width: 240, Height: 280,
+    Width:      240,
+    Height:     280, // 패널의 가시 영역
+    RowOffset:  20,  // GRAM 안에서 패널이 시작하는 행
     LineHeight: 15, Baseline: 11, CharAdvance: 11,
     Foreground: color.RGBA{220, 220, 220, 255},
     Background: color.RGBA{0, 0, 0, 255},
@@ -78,26 +83,27 @@ make monitor PORT=/dev/cu.usbmodemXXXX
 
 ## 패널 변형
 
-기본값은 1.69" Waveshare 240x280 패널이다. 다른 ST7789V3 변형은 `console.Config`
-의 `Width`, `Height`, `LineHeight`, `Baseline`, `CharAdvance` 값을 바꾸면
-된다. 패널의 물리적 rowstart / columnstart 는 **`console.Config` 가 아니라
-`st7789.Config` 의 `RowOffset` / `ColumnOffset`** 으로 지정한다. 콘솔
-패키지는 항상 display-area 좌표(0..Width, 0..Height) 로 동작하고
-드라이버가 해당 offset 을 흡수한다.
+콘솔은 두 가지 좌표계를 분리해 다룬다.
 
-| 패널         | st7789 Width | st7789 Height | st7789 RowOffset | 비고 |
-|--------------|--------------|---------------|------------------|------|
-| 2.0" / 1.9"  | 240          | 320           | 0                | 가장 일반적 |
-| 1.69"        | 240          | 280           | 20 (회전 적용 시) | rowstart 가 회전 0 에서는 드라이버가 무시 — 본문 참고 |
-| 1.47"        | 172          | 320           | 0 (`ColumnOffset` = 34) | column 쪽 offset |
-| 1.3"/1.54"   | 240          | 240           | 0~80              | 회전 방향에 따라 |
+1. **`st7789.Config`** — ST7789 컨트롤러의 GRAM 전체 크기 (거의 모든 변형에서
+   `Width: 240, Height: 320`). RowOffset / ColumnOffset 은 넣지 않는다.
+2. **`console.Config`** — 패널의 가시 영역 크기(`Width`, `Height`) 와 GRAM
+   안에서 가시 영역이 시작하는 위치(`RowOffset`, `ColOffset`). 콘솔이 이
+   값을 모든 `setWindow` 호출과 스크롤 어드레스에 직접 더해 쓰기 때문에,
+   드라이버가 Rotation0 에서 rowstart 를 무시해도 어긋남이 생기지 않는다.
 
-> ⚠️ `tinygo.org/x/drivers/st7789` v0.35.0 의 `setRotation` 은 Rotation0
-> 일 때 `rowOffset = 0` 으로 강제한다. 1.69" 패널처럼 rowstart 가 필요한
-> 변형을 정확히 보정하려면 `st7789.Config{Rotation: drivers.Rotation180,
-> RowOffset: 20}` 처럼 회전을 함께 적용해야 setWindow / SetScrollArea 양쪽이
-> 동일한 오프셋을 사용한다. Rotation0 + rowstart 조합으로 사용하면 패널
-> 상/하단에 ~20px 의 어긋남이 생길 수 있다.
+| 패널         | console Width | console Height | console RowOffset | console ColOffset | 비고 |
+|--------------|---------------|----------------|-------------------|-------------------|------|
+| 2.0" / 1.9"  | 240           | 320            | 0                 | 0                 | 가장 일반적 |
+| 1.69"        | 240           | 280            | **20**            | 0                 | Waveshare 등 |
+| 1.47"        | 172           | 320            | 0                 | **34**            | column 쪽 offset |
+| 1.3"/1.54"   | 240           | 240            | 0 또는 80          | 0                 | 모듈 데이터시트 확인 |
+
+> ℹ️ 이전 버전(`feature/st7789-text-console` 머지 직후)에는 패널 rowstart 가
+> 드라이버에 전달되었는데, `tinygo.org/x/drivers/st7789` v0.35.0 은
+> Rotation0 에서 `rowOffset = 0` 으로 강제하기 때문에 1.69" 패널에서 상단이
+> 잘리고 하단이 비는 증상이 있었다. 현재 버전은 콘솔이 RowOffset 을 직접
+> 보정해 이 문제를 우회한다.
 
 ## 폰트와 컬럼 수
 
@@ -111,14 +117,18 @@ make monitor PORT=/dev/cu.usbmodemXXXX
 
 ## 내부 동작 요약
 
-- `Init` 단계에서 `SetScrollArea(0, Height - rows*LineHeight)` 를 호출해
-  세로 스크롤 영역(VSA)을 줄 단위로 정렬한다 (예: 280 - 18*15 = 10 px 가
-  하단 고정 영역).
-- 라인 카운터 `nextLn` 가 `rows` 미만이면 단순히 다음 줄에 그린다.
-- `nextLn >= rows` 가 되면 새 줄을 그리기 전에 `SetScroll(topRing*LineHeight)`
-  를 먼저 호출해 화면을 한 줄 위로 밀어 올린다. 새 줄이 화면 최하단에서
-  등장한다. 좌표는 패널의 rowstart 와 무관한 display-area 기준이라
-  드라이버의 `setWindow` 와 정렬이 보장된다.
+- `Init` 단계에서 `SetScrollArea(RowOffset, 320 - RowOffset - rows*LineHeight)`
+  를 호출해 GRAM 안에서 패널 가시 영역만 스크롤 영역(VSA) 으로 잡는다.
+  예시 (1.69" 패널): `SetScrollArea(20, 30)` → 물리 VSA = GRAM rows 20..289,
+  하단 10 px 는 BFA. GRAM 0..19 / 300..319 는 off-panel.
+- 라인 카운터 `nextLn` 가 `rows` 미만이면 다음 줄을 GRAM 행 `RowOffset +
+  ringPos * LineHeight` 에 그린다.
+- `nextLn >= rows` 가 되면 그리기 전에 `SetScroll(RowOffset + topRing *
+  LineHeight)` 을 먼저 호출해 화면을 한 줄 위로 밀어 올린다. 새 줄이
+  화면 최하단에서 등장한다.
+- 모든 `FillRectangle` / `tinyfont.WriteLine` 좌표에는 `ColOffset` /
+  `RowOffset` 이 콘솔에서 직접 더해진다 — 드라이버의 Rotation0 이 패널
+  오프셋을 무시해도 콘솔이 GRAM 절대 좌표로 통신하므로 어긋남이 없다.
 - 줄 너비를 넘는 문자열은 자동으로 다음 줄로 줄바꿈된다.
 
 ## 한계
