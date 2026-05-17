@@ -1,8 +1,12 @@
-// Default sketch: poll the Sensirion SGP40 VOC sensor and the ASAIR AHT10
-// temperature + humidity sensor over a shared I2C bus, mirror every status
+// Default sketch: poll the Sensirion SGP40 VOC sensor and the ASAIR AHT20
+// temperature + humidity sensor over a shared I²C0 bus, mirror every status
 // line to both the USB serial console and a 1.69" 240x280 ST7789V3 TFT, and
 // (when WiFi credentials are supplied at build time) push the latest sample
 // of all three signals to a Prometheus Pushgateway in one POST.
+//
+// The T/RH module on the bench is labeled "AHT10" but its silicon
+// answers the AHT20 init command (0xBE), not the AHT10 one (0xE1) — so
+// the firmware uses tinygo.org/x/drivers/aht20.
 //
 // The on-board WS2812 RGB LED is wired up but left dark by default — its
 // bit-banged protocol fights with WiFi IRQs and tends to latch onto a
@@ -21,12 +25,12 @@
 //	VCC -> 3V3
 //	GND -> GND
 //
-// Wiring for the SGP40 + AHT10 breakouts (see docs/sgp40-wiring.md and
-// docs/aht10-wiring.md). Both sensors live on the same I2C0 bus — distinct
-// addresses (SGP40=0x59, AHT10=0x38) keep them from colliding.
+// Wiring for the SGP40 + AHT20 breakouts (shared I²C0 bus, distinct
+// addresses 0x59 and 0x38; see docs/sgp40-wiring.md and docs/aht10-wiring.md
+// — the AHT10 doc covers the AHT20-on-AHT10-board case too):
 //
-//	SDA -> GPIO5   I2C0 data  (shared)
-//	SCL -> GPIO6   I2C0 clock (shared)
+//	SDA -> GPIO5   I²C0 data  (shared)
+//	SCL -> GPIO6   I²C0 clock (shared)
 //	VCC -> 3V3
 //	GND -> GND
 //
@@ -46,17 +50,19 @@ import (
 	"strconv"
 	"time"
 
-	"esp32-s3-ex1/internal/aht10"
 	"esp32-s3-ex1/internal/console"
 	"esp32-s3-ex1/internal/pushgateway"
 	"esp32-s3-ex1/internal/sgp40"
 	"esp32-s3-ex1/internal/ws2812"
+
+	"tinygo.org/x/drivers/aht20"
 
 	"tinygo.org/x/drivers/netdev"
 	nl "tinygo.org/x/drivers/netlink"
 	espnl "tinygo.org/x/espradio/netlink"
 
 	"tinygo.org/x/drivers/st7789"
+	"tinygo.org/x/tinyfont"
 	"tinygo.org/x/tinyfont/freemono"
 )
 
@@ -72,8 +78,8 @@ const (
 	pinRST  = machine.GPIO8
 	pinBL   = machine.GPIO7
 
-	pinSDA = machine.GPIO5
-	pinSCL = machine.GPIO6
+	pinSDA = machine.GPIO5 // I²C0 SDA — SGP40 + AHT20
+	pinSCL = machine.GPIO6 // I²C0 SCL — SGP40 + AHT20
 
 	spiFreqHz = 40_000_000
 	i2cFreqHz = 400_000
@@ -106,13 +112,14 @@ var (
 	password     string
 	pushURL      string
 	pushJob      = "esp32-s3-ex1"
-	pushInstance = "sgp40"
+	pushInstance = "esp32-s3"
 )
 
 var (
 	term   *console.Console
+	disp   *st7789.Device // exposed for direct dashboard rendering
+	rh     *aht20.Device
 	voc    *sgp40.Device
-	rh     *aht10.Device
 	pusher *pushgateway.Pusher
 
 	ledStrip   *ws2812.Device
@@ -176,15 +183,16 @@ func setupDisplay() {
 		return
 	}
 
-	disp := st7789.New(bus, pinRST, pinDC, pinCS, pinBL)
+	d := st7789.New(bus, pinRST, pinDC, pinCS, pinBL)
 	// Tell the driver the controller's full GRAM size; the console handles
 	// the panel rowstart itself because the driver zeroes it at Rotation0.
-	disp.Configure(st7789.Config{
+	d.Configure(st7789.Config{
 		Width:  gramWidth,
 		Height: gramHeight,
 	})
+	disp = &d
 
-	t := console.New(&disp, &freemono.Regular9pt7b, console.Config{
+	t := console.New(disp, &freemono.Regular9pt7b, console.Config{
 		Width:       panelWidth,
 		Height:      panelHeight,
 		RowOffset:   panelRowOffset,
@@ -202,10 +210,82 @@ func setupDisplay() {
 	term = t
 }
 
-// setupSGP40 also brings up the shared I2C0 bus (GPIO5/6). AHT10 sits on
-// the same bus at a different address, so setupAHT10 can run afterwards
-// without touching the bus config.
-func setupSGP40() {
+// Dashboard rendering — once the loop starts, the TFT shows a static
+// three-line readout (T / H / V) updated in place instead of the scrolling
+// boot console. Three rows × dashLineH = 120 px; panelHeight = 280 px;
+// dashY0 = 95 centers the block vertically with ~80 px top/bottom margin.
+var (
+	dashFont  = &freemono.Bold18pt7b
+	dashBG    = color.RGBA{R: 0, G: 0, B: 0, A: 255}
+	dashLineH = int16(40)
+	dashY0    = int16(95)
+	dashX     = int16(10)
+
+	colorTemp = color.RGBA{R: 255, G: 160, B: 60, A: 255}  // warm orange
+	colorHum  = color.RGBA{R: 80, G: 180, B: 255, A: 255}  // cyan/blue
+	colorVOC1 = color.RGBA{R: 80, G: 220, B: 80, A: 255}   // good
+	colorVOC2 = color.RGBA{R: 240, G: 220, B: 60, A: 255}  // moderate
+	colorVOC3 = color.RGBA{R: 240, G: 80, B: 80, A: 255}   // bad
+	colorNA   = color.RGBA{R: 140, G: 140, B: 140, A: 255} // dim grey when data missing
+)
+
+// vocColor maps SGP40 raw ticks to a status color. Lower raw = higher VOC
+// load (resistance drops). Thresholds are rough heuristics, not VOC Index.
+func vocColor(raw uint16) color.RGBA {
+	switch {
+	case raw >= 28000:
+		return colorVOC1
+	case raw >= 25000:
+		return colorVOC2
+	default:
+		return colorVOC3
+	}
+}
+
+// switchToDashboard clears the visible panel and detaches the console so
+// say() / sayColor() only emit to the serial port from this point on.
+func switchToDashboard() {
+	if disp == nil {
+		return
+	}
+	disp.FillRectangle(0, panelRowOffset, panelWidth, panelHeight, dashBG)
+	term = nil
+}
+
+// drawDashboard renders the current readings in place. Each row is cleared
+// to background first so old digits don't bleed through when a value
+// shortens (e.g. 30000 → 9999).
+func drawDashboard(tempC, humPct float32, vocRaw uint16, haveTH, haveVOC bool) {
+	if disp == nil {
+		return
+	}
+	row := func(idx int16, text string, fg color.RGBA) {
+		baseY := panelRowOffset + dashY0 + idx*dashLineH
+		disp.FillRectangle(0, baseY-dashLineH+8, panelWidth, dashLineH, dashBG)
+		tinyfont.WriteLine(disp, dashFont, dashX, baseY, text, fg)
+	}
+	tStr, hStr, vStr := "--.- C", "--.- %", "-----"
+	tFG, hFG, vFG := colorNA, colorNA, colorNA
+	if haveTH {
+		tStr = fmtF(tempC, 1) + " C"
+		hStr = fmtF(humPct, 1) + " %"
+		tFG, hFG = colorTemp, colorHum
+	}
+	if haveVOC {
+		vStr = strconv.FormatUint(uint64(vocRaw), 10)
+		vFG = vocColor(vocRaw)
+	}
+	row(0, "T "+tStr, tFG)
+	row(1, "H "+hStr, hFG)
+	row(2, "V "+vStr, vFG)
+}
+
+// setupAHT20 attaches the ASAIR AHT20 on I²C0 using the TinyGo stock
+// driver (init command 0xBE; AHT10's 0xE1 does not work on the silicon
+// in our "AHT10"-labeled module). A nil rh disables the downstream
+// readout so the firmware still boots cleanly if the chip never
+// responds.
+func setupAHT20() {
 	if err := machine.I2C0.Configure(machine.I2CConfig{
 		Frequency: i2cFreqHz,
 		SDA:       pinSDA,
@@ -214,7 +294,27 @@ func setupSGP40() {
 		say("i2c configure err: " + err.Error())
 		return
 	}
+	time.Sleep(100 * time.Millisecond)
 
+	dev := aht20.New(machine.I2C0)
+	dev.Configure()
+
+	// Confirm with a probe Read — the aht20 driver swallows Tx errors
+	// silently in Configure, so the only honest way to check it actually
+	// talked to a chip is to try a measurement.
+	if err := dev.Read(); err != nil {
+		say("aht20 read err: " + err.Error())
+		return
+	}
+	rh = &dev
+	say("aht20: ready  temp=" + fmtF(dev.Celsius(), 1) + "C rh=" + fmtF(dev.RelHumidity(), 1) + "%")
+}
+
+// setupSGP40 attaches the SGP40 on the I²C0 bus already brought up by
+// setupAHT20. Order matters: AHT20 must finish init first (the on-bench
+// module otherwise interferes with SGP40's first transaction). Empty voc
+// disables the readout downstream so SGP40-less builds keep working.
+func setupSGP40() {
 	dev := sgp40.New(machine.I2C0)
 	if err := dev.Configure(); err != nil {
 		say("sgp40 init err: " + err.Error())
@@ -227,19 +327,6 @@ func setupSGP40() {
 	} else {
 		say("sgp40 serial: " + strconv.FormatUint(sn, 16))
 	}
-}
-
-// setupAHT10 attaches the ASAIR AHT10 temperature/humidity sensor on the
-// same I2C0 bus already brought up by setupSGP40. A nil rh disables the
-// AHT10 readout downstream so SGP40-only builds keep working.
-func setupAHT10() {
-	dev := aht10.New(machine.I2C0)
-	if err := dev.Configure(); err != nil {
-		say("aht10 init err: " + err.Error())
-		return
-	}
-	rh = dev
-	say("aht10: ready")
 }
 
 // setupLED initializes the on-board WS2812 and drives several all-zero
@@ -354,15 +441,12 @@ func fmtF(v float32, prec int) string {
 	return strconv.FormatFloat(float64(v), 'f', prec, 32)
 }
 
-// sampleAndMaybePush runs one measurement cycle: AHT10 first (so its T/RH
+// sampleAndMaybePush runs one measurement cycle: AHT20 first (so its T/RH
 // can compensate the SGP40 measurement), then SGP40. Console + TFT always
 // see the latest values. On every pushIntervalTicks-th invocation the
-// collected metrics are concatenated into a single Pushgateway POST body,
-// which keeps the lneto TCP socket pool from being hammered.
-//
-// Partial-sensor configurations stay valid: if either rh or voc is nil the
-// corresponding metric lines are simply omitted from the body, and SGP40
-// falls back to the datasheet's default 50%RH / 25°C compensation.
+// collected metrics are concatenated into a single Pushgateway POST body
+// to keep the lneto TCP socket pool from being hammered. Either sensor
+// being nil only drops its own lines from the body.
 func sampleAndMaybePush(i int) {
 	var (
 		haveTH        bool
@@ -372,11 +456,10 @@ func sampleAndMaybePush(i int) {
 	)
 
 	if rh != nil {
-		t, h, err := rh.Measure()
-		if err != nil {
-			say("aht10 err: " + err.Error())
+		if err := rh.Read(); err != nil {
+			say("aht20 err: " + err.Error())
 		} else {
-			tempC, humPct, haveTH = t, h, true
+			tempC, humPct, haveTH = rh.Celsius(), rh.RelHumidity(), true
 			say("temp: " + fmtF(tempC, 1) + "C  rh: " + fmtF(humPct, 1) + "%")
 		}
 	}
@@ -395,13 +478,15 @@ func sampleAndMaybePush(i int) {
 		}
 	}
 
-	if pusher == nil || i%pushIntervalTicks != 0 {
+	drawDashboard(tempC, humPct, vocRaw, haveTH, haveVOC)
+
+	if pusher == nil {
 		return
 	}
 	body := ""
 	if haveTH {
-		body += "aht10_temperature_celsius " + fmtF(tempC, 2) + "\n"
-		body += "aht10_humidity_percent " + fmtF(humPct, 2) + "\n"
+		body += "aht20_temperature_celsius " + fmtF(tempC, 2) + "\n"
+		body += "aht20_humidity_percent " + fmtF(humPct, 2) + "\n"
 	}
 	if haveVOC {
 		body += "sgp40_voc_raw " + strconv.FormatUint(uint64(vocRaw), 10) + "\n"
@@ -411,19 +496,29 @@ func sampleAndMaybePush(i int) {
 	}
 	if err := pusher.Push(body); err != nil {
 		sayColor("push err: "+err.Error(), colorPushErr)
-	} else {
-		sayColor("pushed @ i="+strconv.Itoa(i), colorPushOK)
+		return
 	}
+	msg := "pushed @ i=" + strconv.Itoa(i)
+	if haveTH {
+		msg += " T=" + fmtF(tempC, 1) + "C RH=" + fmtF(humPct, 1) + "%"
+	}
+	if haveVOC {
+		msg += " voc=" + strconv.FormatUint(uint64(vocRaw), 10)
+	}
+	sayColor(msg, colorPushOK)
 }
 
 func main() {
 	time.Sleep(2 * time.Second)
 
 	setupDisplay()
-	say("ST7789V3 + WS2812 + SGP40 + AHT10")
+	say("ST7789V3 + SGP40 + AHT20")
 	say("---------------------------------")
+	// AHT20 first: bus init + sensor handshake completes before SGP40
+	// touches I²C0. Reversing the order leaves AHT20's first transaction
+	// racing SGP40's and is what tripped the earlier debug session.
+	setupAHT20()
 	setupSGP40()
-	setupAHT10()
 	setupLED()
 	setupWiFi()
 	setupPusher()
@@ -434,17 +529,18 @@ func main() {
 		say("cpu freq: " + strconv.FormatUint(uint64(freq), 10))
 	}
 
+	// Drop the scrolling boot console; the TFT becomes a static dashboard
+	// from here on. Serial keeps receiving every say() call.
+	switchToDashboard()
+	drawDashboard(0, 0, 0, false, false)
+
 	for i := 0; ; i++ {
 		cycleLED(i)
-		// Poll both sensors once per second (every other palette tick) — the
-		// SGP40 gas-index calibration assumes 1 Hz sampling and AHT10 is
-		// happy at the same cadence.
-		//
-		// Pushgateway POSTs are gated to once per pushIntervalTicks. The
-		// lneto net stack has a small TCP socket pool and each connection
-		// sits in TIME_WAIT for tens of seconds, so a 1 Hz push exhausts the
-		// pool ("resource exhausted") within a handful of iterations.
-		if i%2 == 0 {
+		// Sensors + dashboard + push all on the same pushIntervalTicks
+		// cadence — sampling more often than push only burns power and
+		// makes the TFT flicker, since the gas-index algorithm that wants
+		// 1 Hz sampling isn't implemented anyway.
+		if i%pushIntervalTicks == 0 {
 			sampleAndMaybePush(i)
 		}
 		time.Sleep(500 * time.Millisecond)

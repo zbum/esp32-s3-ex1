@@ -12,7 +12,7 @@ SSID          ?=
 PASSWORD      ?=
 PUSH_URL      ?=
 PUSH_JOB      ?= esp32-s3-ex1
-PUSH_INSTANCE ?= sgp40
+PUSH_INSTANCE ?= esp32-s3
 
 LDFLAGS =
 ifneq ($(strip $(SSID)),)
