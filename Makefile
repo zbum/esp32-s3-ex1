@@ -1,6 +1,6 @@
 TARGET     ?= esp32s3-generic
 CHIP       ?= esp32s3
-PORT       ?= /dev/cu.usbmodem2101
+PORT       ?= /dev/cu.usbmodem21101
 OUT        ?= build/firmware.bin
 BAUD       ?= 460800
 MON_BAUD   ?= 115200
