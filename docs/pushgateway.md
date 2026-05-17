@@ -1,20 +1,26 @@
 # Prometheus Pushgateway 연동 가이드
 
-ESP32-S3 가 WiFi 로 접속해서 **SGP40 raw VOC tick** 을 Prometheus
-[Pushgateway](https://github.com/prometheus/pushgateway) 로 1초마다 POST
-하는 설정. 코드는 모두 `main.go` + `internal/pushgateway/` 안에 들어 있고,
-WiFi 자격증명과 게이트웨이 주소는 **빌드 시 ldflags 로 주입** 한다 (소스
-트리에 남기지 않는다).
+ESP32-S3 가 WiFi 로 접속해서 **SGP40 raw VOC tick + AHT10 온도/습도** 를
+Prometheus [Pushgateway](https://github.com/prometheus/pushgateway) 로
+주기적으로 POST 하는 설정. 코드는 모두 `main.go` + `internal/pushgateway/`
+안에 들어 있고, WiFi 자격증명과 게이트웨이 주소는 **빌드 시 ldflags 로
+주입** 한다 (소스 트리에 남기지 않는다).
 
 ## 1. 데이터 흐름
 
 ```
-  SGP40 (I2C)                ESP32-S3                  Pushgateway
- ──────────────────  →  ─────────────────────────  →  ─────────────
- measure_raw_signal       net/http.Post              /metrics/job/<job>/
- (0x260F)                 (espradio + netlink)        instance/<instance>
- raw uint16               body: sgp40_voc_raw N\n     Prometheus scrape
+  SGP40 + AHT10 (I2C0)       ESP32-S3                     Pushgateway
+ ──────────────────────  →  ────────────────────────  →  ─────────────
+ SGP40 measure_raw_signal    raw TCP POST                /metrics/job/<job>/
+ AHT10 measure (T/RH)        (espradio + netlink)         instance/<instance>
+                             body (multi-line):           Prometheus scrape
+                               aht10_temperature_celsius
+                               aht10_humidity_percent
+                               sgp40_voc_raw
 ```
+
+AHT10 의 T/RH 값은 SGP40 의 `MeasureRawCompensated` 보정값으로도 같이
+들어가서, 습도/온도 cross-sensitivity 가 줄어든 raw tick 이 push 된다.
 
 호스트 측 Prometheus 는 Pushgateway 를 평소처럼 scrape 하면 된다 — 보드가
 오프라인이어도 마지막 push 값이 게이트웨이에 남는다 (게이트웨이가 그렇게
@@ -40,11 +46,16 @@ WiFi/푸시 단계가 통째로 스킵** 되고 보드는 기존 디스플레이
 <PUSH_URL>/metrics/job/<PUSH_JOB>/instance/<PUSH_INSTANCE>
 ```
 
-Body 는 Prometheus text exposition 1줄:
+Body 는 Prometheus text exposition 여러 줄 (한 push 에 묶음):
 
 ```
+aht10_temperature_celsius 23.45
+aht10_humidity_percent 47.12
 sgp40_voc_raw 28664
 ```
+
+센서 하나가 측정 실패하면 해당 라인은 그냥 빠진다. AHT10 단독, SGP40 단독
+구성도 그대로 동작.
 
 ## 3. 플래시 예시
 
@@ -68,11 +79,13 @@ make flash PORT=/dev/cu.usbmodem21101
 
 ```
 sgp40 serial: <hex>
+aht10: ready
 wifi: connecting to YourSSID
 wifi mac: xx:xx:xx:xx:xx:xx
 wifi: connected
 push: http://192.168.0.10:9091/metrics/job/esp32-s3-ex1/instance/sgp40
 ...
+temp: 23.5C  rh: 47.1%
 voc raw: 28664
 ```
 
@@ -81,12 +94,16 @@ voc raw: 28664
 호스트에서 게이트웨이가 받았는지 빠른 확인:
 
 ```bash
-curl -s http://192.168.0.10:9091/metrics | grep sgp40_voc_raw
+curl -s http://192.168.0.10:9091/metrics | grep -E 'sgp40_voc_raw|aht10_'
 ```
 
 예상 출력:
 
 ```
+# TYPE aht10_humidity_percent untyped
+aht10_humidity_percent{instance="sgp40",job="esp32-s3-ex1"} 47.12
+# TYPE aht10_temperature_celsius untyped
+aht10_temperature_celsius{instance="sgp40",job="esp32-s3-ex1"} 23.45
 # TYPE sgp40_voc_raw untyped
 sgp40_voc_raw{instance="sgp40",job="esp32-s3-ex1"} 28664
 ```
@@ -105,9 +122,11 @@ gauge 로 잡고 싶으면 `internal/pushgateway/pushgateway.go` 의 호출부�
   에 바인딩하고 `NetConnect` 호출. SSID 가 비어 있으면 즉시 리턴.
 - **`main.go::setupPusher`** — `pushURL` + job + instance 를 합쳐 Pusher 를
   생성하고 패키지 변수에 저장.
-- **`main.go::main` 루프** — SGP40 측정 성공 시 raw 값을 `sgp40_voc_raw <N>`
-  형식으로 push. WiFi 가 꺼져 있거나 push 가 실패해도 시리얼/디스플레이는
-  계속 동작.
+- **`main.go::sampleAndMaybePush`** — 매 1초 cycle 의 측정 + 조건부 push.
+  AHT10 → SGP40 순으로 읽고(보정값 전달), pushIntervalTicks 마다 세 메트릭
+  라인을 한 body 로 묶어 POST. 한쪽 센서가 빠져도 나머지 라인은 그대로 push.
+- **`main.go::main` 루프** — `cycleLED` + 1Hz `sampleAndMaybePush` 호출만
+  한다. WiFi 가 꺼져 있거나 push 가 실패해도 시리얼/디스플레이는 계속 동작.
 
 ## 6. 인터벌 / 부하
 
