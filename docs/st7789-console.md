@@ -39,12 +39,13 @@ for i := 0; i < 100; i++ {
 }
 ```
 
-전체 데모는 `cmd/console/main.go` 에 있다. 다음과 같이 빌드 / 플래시한다.
+전체 데모는 루트 `main.go` 에 통합돼 있다 (`say()` 헬퍼로 USB 시리얼
+`println` 과 ST7789 콘솔 양쪽에 동시에 출력). 다음과 같이 빌드 / 플래시한다.
 
 ```bash
-make console                              # build/console.bin 생성
-make flash-console PORT=/dev/cu.usbmodemXXXX
-make monitor      PORT=/dev/cu.usbmodemXXXX
+make build                                # build/firmware.bin 생성
+make flash   PORT=/dev/cu.usbmodemXXXX
+make monitor PORT=/dev/cu.usbmodemXXXX
 ```
 
 ## 결선 (기본 핀)
@@ -70,9 +71,10 @@ make monitor      PORT=/dev/cu.usbmodemXXXX
 > 사용하지 않는다. VDDIO_1.8 라인은 모듈 PCB 내부에서 처리되며 외부
 > 결선 불필요.
 
-핀을 바꾸려면 `cmd/console/main.go` 상단의 상수만 수정한다. N16R8 모듈은
-GPIO35/36/37 이 옥탈 PSRAM 에 점유되므로 사용하지 않는다 — 자세한 안전
-핀 목록은 [docs/gpio-pin-mapping.md](gpio-pin-mapping.md) 참고.
+핀을 바꾸려면 루트 `main.go` 상단의 `pinSCK` / `pinMOSI` / `pinDC` /
+`pinCS` / `pinRST` / `pinBL` 상수만 수정한다. N16R8 모듈은 GPIO35/36/37 이
+옥탈 PSRAM 에 점유되므로 사용하지 않는다 — 자세한 안전 핀 목록은
+[docs/gpio-pin-mapping.md](gpio-pin-mapping.md) 참고.
 
 ## 패널 변형
 

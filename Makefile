@@ -22,18 +22,16 @@ LDFLAGS = -ldflags="\
  -X main.deviceID=$(DEVICE_ID)"
 endif
 
-.PHONY: build console flash flash-console monitor all clean test help
+.PHONY: build flash monitor all clean test help
 
 help:
 	@echo "Targets:"
-	@echo "  build         - compile root firmware (LED blink) to $(OUT)"
-	@echo "  console       - compile cmd/console (ST7789V3 text console demo) to build/console.bin"
-	@echo "  flash         - flash root firmware to board on $(PORT)"
-	@echo "  flash-console - flash console demo to board on $(PORT)"
-	@echo "  monitor       - open serial monitor on $(PORT)"
-	@echo "  all           - build, flash, then monitor"
-	@echo "  clean         - remove build artifacts"
-	@echo "  test          - run host-side go tests"
+	@echo "  build     - compile firmware (WS2812 + ST7789V3 console) to $(OUT)"
+	@echo "  flash     - flash firmware to board on $(PORT)"
+	@echo "  monitor   - open serial monitor on $(PORT)"
+	@echo "  all       - build, flash, then monitor"
+	@echo "  clean     - remove build artifacts"
+	@echo "  test      - run host-side go tests"
 	@echo ""
 	@echo "Variables (override with VAR=value):"
 	@echo "  TARGET=$(TARGET)   CHIP=$(CHIP)"
@@ -45,15 +43,8 @@ build:
 	@mkdir -p $(dir $(OUT))
 	tinygo build -target $(TARGET) $(LDFLAGS) -o $(OUT) .
 
-console:
-	@mkdir -p build
-	tinygo build -target $(TARGET) -o build/console.bin ./cmd/console
-
 flash: build
 	$(ESPFLASHER) -port $(PORT) -chip $(CHIP) -baud $(BAUD) -reset $(RESET) $(OUT)
-
-flash-console: console
-	$(ESPFLASHER) -port $(PORT) -chip $(CHIP) -baud $(BAUD) -reset $(RESET) build/console.bin
 
 monitor:
 	tinygo monitor -port $(PORT) -baudrate $(MON_BAUD)

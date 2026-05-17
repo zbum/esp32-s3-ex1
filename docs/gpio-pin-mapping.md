@@ -110,7 +110,7 @@ machine.I2C0.Configure(machine.I2CConfig{
 ST7789 데모를 다른 핀으로 옮기는 예:
 
 ```go
-// cmd/console/main.go 상단 상수만 바꾼다
+// 루트 main.go 상단 상수만 바꾼다
 const (
     pinSCK  = machine.GPIO14   // 12 → 14
     pinMOSI = machine.GPIO13   // 11 → 13
@@ -124,8 +124,8 @@ const (
 그 후 다시 빌드 / 플래시:
 
 ```bash
-make console
-make flash-console PORT=/dev/cu.usbmodemXXXX
+make build
+make flash PORT=/dev/cu.usbmodemXXXX
 ```
 
 WS2812 / DHT22 도 동일한 패턴으로 `main.go` / `main.go.backup` 상단 상수를
