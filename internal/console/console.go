@@ -133,8 +133,16 @@ func (c *Console) Rows() int { return int(c.rows) }
 // Println writes a single logical line and advances the cursor. Lines wider
 // than Cols() are wrapped onto consecutive rows.
 func (c *Console) Println(s string) {
+	c.PrintlnColor(s, c.cfg.Foreground)
+}
+
+// PrintlnColor writes a single logical line in the supplied foreground color
+// instead of the default. The background and cell metrics are unchanged so a
+// colored line still fits the ring and scrolls like any other line — useful
+// for status accents (success in green, errors in red, etc.).
+func (c *Console) PrintlnColor(s string, fg color.RGBA) {
 	if s == "" {
-		c.writeLine("")
+		c.writeLine("", fg)
 		return
 	}
 	runes := []rune(s)
@@ -146,7 +154,7 @@ func (c *Console) Println(s string) {
 		} else {
 			runes = nil
 		}
-		c.writeLine(string(chunk))
+		c.writeLine(string(chunk), fg)
 	}
 }
 
@@ -187,7 +195,7 @@ func (c *Console) Write(p []byte) (int, error) {
 // Rotation0, so the console adds RowOffset itself for both the blit position
 // and the scroll address. That keeps content and scroll register in lockstep
 // regardless of which panel variant is wired up.
-func (c *Console) writeLine(text string) {
+func (c *Console) writeLine(text string, fg color.RGBA) {
 	rows := uint32(c.rows)
 	if c.nextLn >= rows {
 		topRing := (c.nextLn - rows + 1) % rows
@@ -197,7 +205,7 @@ func (c *Console) writeLine(text string) {
 	ramY := int16(int32(c.cfg.RowOffset) + int32(ringPos)*int32(c.cfg.LineHeight))
 	c.disp.FillRectangle(c.cfg.ColOffset, ramY, c.cfg.Width, c.cfg.LineHeight, c.cfg.Background)
 	if text != "" {
-		tinyfont.WriteLine(c.disp, c.font, c.cfg.ColOffset, ramY+c.cfg.Baseline, text, c.cfg.Foreground)
+		tinyfont.WriteLine(c.disp, c.font, c.cfg.ColOffset, ramY+c.cfg.Baseline, text, fg)
 	}
 	c.nextLn++
 }

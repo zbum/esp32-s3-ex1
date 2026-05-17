@@ -1,8 +1,12 @@
-// Default sketch: cycle the on-board WS2812 through a palette, poll the
-// Sensirion SGP40 VOC sensor over I2C, mirror every status line to both the
-// USB serial console and a 1.69" 240x280 ST7789V3 TFT, and (when WiFi
-// credentials are supplied at build time) push each SGP40 raw tick to a
-// Prometheus Pushgateway.
+// Default sketch: poll the Sensirion SGP40 VOC sensor over I2C, mirror
+// every status line to both the USB serial console and a 1.69" 240x280
+// ST7789V3 TFT, and (when WiFi credentials are supplied at build time)
+// push each SGP40 raw tick to a Prometheus Pushgateway.
+//
+// The on-board WS2812 RGB LED is wired up but left dark by default — its
+// bit-banged protocol fights with WiFi IRQs and tends to latch onto a
+// random color (green in this project). Call enableLED() if you want the
+// palette demo back; see ledEnabled and cycleLED.
 //
 // Wiring for the ST7789V3 panel (see docs/gpio-pin-mapping.md for the rules
 // behind these choices):
@@ -81,6 +85,13 @@ const (
 	lineHeight  = 15
 	baselineY   = 11
 	charAdvance = 11
+
+	// Loop sleeps 500 ms per tick. pushIntervalTicks*500 ms = push period.
+	// 120 ticks = 60 s. Tried 30 ticks (15 s) first but the second push was
+	// still failing with lneto.ErrExhausted — the socket from the prior
+	// connection had not yet finished TIME_WAIT inside lneto's small TCP
+	// pool. 60 s gives the previous socket time to fully release.
+	pushIntervalTicks = 120
 )
 
 // ldflags-injected credentials and Pushgateway target. Defaults make local
@@ -98,6 +109,29 @@ var (
 	term   *console.Console
 	voc    *sgp40.Device
 	pusher *pushgateway.Pusher
+
+	ledStrip   *ws2812.Device
+	ledPixels  []color.RGBA
+	// The on-board WS2812 is bit-banged with sub-microsecond pulse widths;
+	// WiFi IRQs corrupt those frames and the LED latches onto the last
+	// garbled value (in this project, green). Default to off; flip via
+	// enableLED() if you really want the palette demo back.
+	ledEnabled = false
+)
+
+// ledPalette / ledNames drive the WS2812 demo cycle. Kept at package scope so
+// cycleLED stays a pure function over the loop counter.
+var (
+	ledPalette = []color.RGBA{
+		{R: 255, G: 0, B: 0, A: 255},
+		{R: 0, G: 255, B: 0, A: 255},
+		{R: 0, G: 0, B: 255, A: 255},
+		{R: 255, G: 255, B: 0, A: 255},
+		{R: 0, G: 255, B: 255, A: 255},
+		{R: 255, G: 0, B: 255, A: 255},
+		{R: 255, G: 255, B: 255, A: 255},
+	}
+	ledNames = []string{"red", "green", "blue", "yellow", "cyan", "magenta", "white"}
 )
 
 // say prints to USB serial via println and mirrors the same string to the
@@ -109,6 +143,21 @@ func say(s string) {
 		term.Println(s)
 	}
 }
+
+// sayColor is like say but renders the on-screen copy in a non-default
+// foreground color. Serial output ignores the color since it has none.
+// Used to flag push successes (green) and push errors (red) on the TFT.
+func sayColor(s string, fg color.RGBA) {
+	println(s)
+	if term != nil {
+		term.PrintlnColor(s, fg)
+	}
+}
+
+var (
+	colorPushOK  = color.RGBA{R: 80, G: 220, B: 80, A: 255}
+	colorPushErr = color.RGBA{R: 220, G: 80, B: 80, A: 255}
+)
 
 func setupDisplay() {
 	bus := machine.SPI0
@@ -172,6 +221,72 @@ func setupSGP40() {
 	}
 }
 
+// setupLED initializes the on-board WS2812 and drives several all-zero
+// frames so the LED is dark regardless of whatever the previous firmware
+// (or a soft reset) left latched in the controller. One frame is often
+// enough, but a soft-reset path keeps the previous color on the chip's
+// internal register, and a single bit-bang occasionally loses sync with
+// the chip's >50 us reset gap on the first try — repeating with a clear
+// gap between attempts is much more reliable. ledEnabled defaults to
+// false, so once we've forced black nothing else writes to the strip.
+func setupLED() {
+	ledPin.Configure(machine.PinConfig{Mode: machine.PinOutput})
+	ledPin.Low()
+	time.Sleep(1 * time.Millisecond)
+
+	strip := ws2812.NewWS2812(ledPin)
+	strip.SetBrightness(brightness)
+	ledStrip = &strip
+	ledPixels = make([]color.RGBA, numPixels)
+
+	for k := 0; k < 5; k++ {
+		_ = ledStrip.WriteColors(ledPixels)
+		time.Sleep(1 * time.Millisecond)
+	}
+	say("led: forced off (" + strconv.Itoa(5) + " black frames)")
+}
+
+// cycleLED writes the i'th palette color to the strip and logs the name.
+// No-op when the LED is disabled or never initialized — keeps the main loop
+// branch-free.
+func cycleLED(i int) {
+	if !ledEnabled || ledStrip == nil {
+		return
+	}
+	idx := i % len(ledPalette)
+	c := ledPalette[idx]
+	for j := range ledPixels {
+		ledPixels[j] = c
+	}
+	if err := ledStrip.WriteColors(ledPixels); err != nil {
+		say("write err: " + err.Error())
+		return
+	}
+	say(strconv.Itoa(i) + ": " + ledNames[idx])
+}
+
+// enableLED re-enables the cycle. The next cycleLED tick paints a fresh
+// color, so no explicit refresh is needed here.
+func enableLED() {
+	ledEnabled = true
+}
+
+// disableLED stops the cycle and blanks the strip. WS2812 is a bit-banged
+// protocol with sub-microsecond timing; once the WiFi radio is active the
+// bus interrupts corrupt frames and the LED tends to latch on whatever
+// garbled value happened to clock through last (in this project, green).
+// Disabling after WiFi comes up keeps the indication consistent.
+func disableLED() {
+	ledEnabled = false
+	if ledStrip == nil {
+		return
+	}
+	for j := range ledPixels {
+		ledPixels[j] = color.RGBA{}
+	}
+	_ = ledStrip.WriteColors(ledPixels)
+}
+
 // setupWiFi brings up the ESP32-S3 native radio via espradio's netlink
 // implementation and binds it as the default netdev for net/http. Skipped
 // when no SSID was injected at build time so the board still works as a
@@ -218,6 +333,7 @@ func main() {
 	say("ST7789V3 + WS2812 + SGP40")
 	say("-------------------------")
 	setupSGP40()
+	setupLED()
 	setupWiFi()
 	setupPusher()
 
@@ -227,45 +343,27 @@ func main() {
 		say("cpu freq: " + strconv.FormatUint(uint64(freq), 10))
 	}
 
-	ledPin.Configure(machine.PinConfig{Mode: machine.PinOutput})
-
-	strip := ws2812.NewWS2812(ledPin)
-	strip.SetBrightness(brightness)
-
-	pixels := make([]color.RGBA, numPixels)
-	palette := []color.RGBA{
-		{R: 255, G: 0, B: 0, A: 255},
-		{R: 0, G: 255, B: 0, A: 255},
-		{R: 0, G: 0, B: 255, A: 255},
-		{R: 255, G: 255, B: 0, A: 255},
-		{R: 0, G: 255, B: 255, A: 255},
-		{R: 255, G: 0, B: 255, A: 255},
-		{R: 255, G: 255, B: 255, A: 255},
-	}
-	names := []string{"red", "green", "blue", "yellow", "cyan", "magenta", "white"}
-
 	for i := 0; ; i++ {
-		idx := i % len(palette)
-		c := palette[idx]
-		for j := range pixels {
-			pixels[j] = c
-		}
-		if err := strip.WriteColors(pixels); err != nil {
-			say("write err: " + err.Error())
-		} else {
-			say(strconv.Itoa(i) + ": " + names[idx])
-		}
+		cycleLED(i)
 		// Poll the SGP40 once per second (every other palette tick) — the
 		// sensor's gas-index calibration assumes 1 Hz sampling.
+		//
+		// Pushgateway POSTs are gated to once per ~15 s independently of the
+		// sensor read. The lneto net stack has a small TCP socket pool and
+		// one-shot http.Post leaves each connection in TIME_WAIT for tens of
+		// seconds, so a 1 Hz push exhausts the pool ("resource exhausted")
+		// within a handful of iterations.
 		if voc != nil && i%2 == 0 {
 			if raw, err := voc.MeasureRaw(); err != nil {
 				say("voc err: " + err.Error())
 			} else {
 				rawStr := strconv.FormatUint(uint64(raw), 10)
 				say("voc raw: " + rawStr)
-				if pusher != nil {
+				if pusher != nil && i%pushIntervalTicks == 0 {
 					if err := pusher.Push("sgp40_voc_raw " + rawStr); err != nil {
-						say("push err: " + err.Error())
+						sayColor("push err: "+err.Error(), colorPushErr)
+					} else {
+						sayColor("pushed @ i="+strconv.Itoa(i), colorPushOK)
 					}
 				}
 			}

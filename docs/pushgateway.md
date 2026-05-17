@@ -111,11 +111,20 @@ gauge 로 잡고 싶으면 `internal/pushgateway/pushgateway.go` 의 호출부�
 
 ## 6. 인터벌 / 부하
 
-- 현재 push 주기 = SGP40 측정 주기 = **1 Hz**.
-- Pushgateway 는 마지막 값만 보관하므로 더 자주 보내도 메모리 폭증은 없지만,
-  Prometheus scrape 간격(보통 15s) 보다 빠르게 보내봤자 의미가 떨어진다.
-- 부하를 더 줄이고 싶으면 `main.go` 의 루프 카운터(`i%2 == 0`)를
-  `i%30 == 0` (15초마다) 등으로 늘리면 된다.
+- **SGP40 측정 주기 = 1 Hz** (콘솔 / TFT 라이브 표시).
+- **Push 주기 = 60 s** (`pushIntervalTicks = 120`, 500 ms × 120).
+- 분리한 이유: lneto 의 TCP 소켓 풀은 작고, `net/http.Post` 1회마다 새
+  커넥션이 열렸다 닫히며 수십 초 TIME_WAIT 상태로 머문다. 1 Hz push 면
+  풀이 금세 비워지지 않아 **`push err: resource exhausted`** 가 난다.
+  실측해 보면 15 s 간격도 두 번째 push 부터 실패 — TIME_WAIT 가 그보다
+  길다. 60 s 가 안정 동작 최소선이고, 그래도 가끔 실패하면 더 늘리는 게
+  안전.
+- Prometheus scrape 간격(보통 15 s) 보다 길어지지만, Pushgateway 는 마지막
+  값만 보관해서 scrape 측에서 같은 값을 반복해 읽는 형태가 된다. 시계열은
+  여전히 1분 해상도로 채워진다.
+- 더 줄이려면 lneto 의 TCP 회수 동작이 좋아질 때까지 기다리거나, raw
+  `net.Dial` + 수동 close 패턴(참고 프로젝트 `tinygo-air-measurer/httpclient.go`)
+  으로 다시 작성해야 한다.
 
 ## 7. 트러블슈팅
 
@@ -127,6 +136,8 @@ gauge 로 잡고 싶으면 `internal/pushgateway/pushgateway.go` 의 호출부�
 | `push err: status 405` | URL 끝의 `job/.../instance/...` 경로 오타. 게이트웨이는 정확한 `/metrics/job/X` 형식을 요구. |
 | Pushgateway 에는 값이 보이는데 Prometheus 에 안 나옴 | Prometheus `prometheus.yml` 의 `scrape_configs` 에 pushgateway job 이 등록돼 있고 `honor_labels: true` 인지 확인. |
 | 빌드는 되는데 부트 후 멈춤 | WiFi 연결이 매우 느릴 때 발생 가능. `setupWiFi` 가 블로킹 호출 — SSID 가 잘못된 환경에 던지면 안 됨. |
+| `SHA-256 comparison failed: ... Attempting to boot anyway...` | **무시.** espradio 가 펌웨어 블롭에 박아두는 정상 부트 메시지(`espradio` README 도 그대로 보여줌). 뒤에 `entry 0x...` → `Connecting to WiFi...` 가 이어지면 정상. |
+| `push err: resource exhausted` 가 반복 | lneto TCP 소켓 풀 고갈. `pushIntervalTicks` 를 더 늘릴 것 (현재 30 → 15 s, 60 → 30 s). |
 
 ## 8. 보안 / 비밀 관리
 
