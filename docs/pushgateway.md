@@ -1,0 +1,137 @@
+# Prometheus Pushgateway 연동 가이드
+
+ESP32-S3 가 WiFi 로 접속해서 **SGP40 raw VOC tick** 을 Prometheus
+[Pushgateway](https://github.com/prometheus/pushgateway) 로 1초마다 POST
+하는 설정. 코드는 모두 `main.go` + `internal/pushgateway/` 안에 들어 있고,
+WiFi 자격증명과 게이트웨이 주소는 **빌드 시 ldflags 로 주입** 한다 (소스
+트리에 남기지 않는다).
+
+## 1. 데이터 흐름
+
+```
+  SGP40 (I2C)                ESP32-S3                  Pushgateway
+ ──────────────────  →  ─────────────────────────  →  ─────────────
+ measure_raw_signal       net/http.Post              /metrics/job/<job>/
+ (0x260F)                 (espradio + netlink)        instance/<instance>
+ raw uint16               body: sgp40_voc_raw N\n     Prometheus scrape
+```
+
+호스트 측 Prometheus 는 Pushgateway 를 평소처럼 scrape 하면 된다 — 보드가
+오프라인이어도 마지막 push 값이 게이트웨이에 남는다 (게이트웨이가 그렇게
+설계됨).
+
+## 2. 빌드 시 주입하는 변수
+
+`main.go` 상단의 변수는 비어 있는 상태로 컴파일되므로, **SSID 가 비어 있으면
+WiFi/푸시 단계가 통째로 스킵** 되고 보드는 기존 디스플레이 + WS2812 + SGP40
+로컬 모드로만 동작한다.
+
+| Make 변수 | `main.go` 심볼 | 기본값 | 용도 |
+|-----------|----------------|--------|------|
+| `SSID`          | `ssid`         | (없음) | WiFi SSID. 비우면 WiFi 비활성. |
+| `PASSWORD`      | `password`     | (없음) | WiFi 패스프레이즈 |
+| `PUSH_URL`      | `pushURL`      | (없음) | 게이트웨이 base. 예: `http://192.168.0.10:9091` |
+| `PUSH_JOB`      | `pushJob`      | `esp32-s3-ex1` | Prometheus `job` 라벨 |
+| `PUSH_INSTANCE` | `pushInstance` | `sgp40`         | Prometheus `instance` 라벨 |
+
+최종 POST 대상:
+
+```
+<PUSH_URL>/metrics/job/<PUSH_JOB>/instance/<PUSH_INSTANCE>
+```
+
+Body 는 Prometheus text exposition 1줄:
+
+```
+sgp40_voc_raw 28664
+```
+
+## 3. 플래시 예시
+
+WiFi + Pushgateway 같이:
+
+```bash
+make flash \
+  SSID=YourSSID PASSWORD=YourPassword \
+  PUSH_URL=http://192.168.0.10:9091 \
+  PUSH_JOB=esp32-s3-ex1 PUSH_INSTANCE=sgp40 \
+  PORT=/dev/cu.usbmodem21101
+```
+
+WiFi 없이 (로컬 디스플레이/시리얼만):
+
+```bash
+make flash PORT=/dev/cu.usbmodem21101
+```
+
+부트 직후 시리얼 / TFT 콘솔에 다음 줄이 보이면 정상:
+
+```
+sgp40 serial: <hex>
+wifi: connecting to YourSSID
+wifi mac: xx:xx:xx:xx:xx:xx
+wifi: connected
+push: http://192.168.0.10:9091/metrics/job/esp32-s3-ex1/instance/sgp40
+...
+voc raw: 28664
+```
+
+## 4. 게이트웨이 측 점검
+
+호스트에서 게이트웨이가 받았는지 빠른 확인:
+
+```bash
+curl -s http://192.168.0.10:9091/metrics | grep sgp40_voc_raw
+```
+
+예상 출력:
+
+```
+# TYPE sgp40_voc_raw untyped
+sgp40_voc_raw{instance="sgp40",job="esp32-s3-ex1"} 28664
+```
+
+`TYPE` 가 `untyped` 인 이유: 본 펌웨어는 body 에 `# TYPE ... gauge` 헤더를
+보내지 않는다. Prometheus 가 scrape 할 때는 큰 문제가 없지만, 명시적으로
+gauge 로 잡고 싶으면 `internal/pushgateway/pushgateway.go` 의 호출부에서 헤더
+줄을 함께 보내도록 확장하면 된다.
+
+## 5. 코드 구성
+
+- **`internal/pushgateway/pushgateway.go`** — `Pusher{URL}` + `Push(body)` 뿐인
+  얇은 래퍼. `net/http.Post` 위에 trailing newline 처리, 3xx 이상 status 에서
+  에러를 돌려준다.
+- **`main.go::setupWiFi`** — `espradio/netlink.Esplink` 를 `drivers/netdev`
+  에 바인딩하고 `NetConnect` 호출. SSID 가 비어 있으면 즉시 리턴.
+- **`main.go::setupPusher`** — `pushURL` + job + instance 를 합쳐 Pusher 를
+  생성하고 패키지 변수에 저장.
+- **`main.go::main` 루프** — SGP40 측정 성공 시 raw 값을 `sgp40_voc_raw <N>`
+  형식으로 push. WiFi 가 꺼져 있거나 push 가 실패해도 시리얼/디스플레이는
+  계속 동작.
+
+## 6. 인터벌 / 부하
+
+- 현재 push 주기 = SGP40 측정 주기 = **1 Hz**.
+- Pushgateway 는 마지막 값만 보관하므로 더 자주 보내도 메모리 폭증은 없지만,
+  Prometheus scrape 간격(보통 15s) 보다 빠르게 보내봤자 의미가 떨어진다.
+- 부하를 더 줄이고 싶으면 `main.go` 의 루프 카운터(`i%2 == 0`)를
+  `i%30 == 0` (15초마다) 등으로 늘리면 된다.
+
+## 7. 트러블슈팅
+
+| 증상 | 점검 |
+|------|------|
+| `wifi err: ...` | SSID/PASSWORD 오타, 2.4 GHz 대역인지 확인 (ESP32-S3 는 2.4 GHz only). |
+| `push err: dial tcp: ...` | `PUSH_URL` 호스트가 보드와 같은 LAN 인지, 방화벽이 9091 열려 있는지. |
+| `push err: status 400` | 보통 body 가 빈 줄로 끝나지 않은 경우. `pushgateway.Push` 가 자동 trailing newline 을 붙이지만 메트릭 이름에 공백이 들어가면 거부됨. |
+| `push err: status 405` | URL 끝의 `job/.../instance/...` 경로 오타. 게이트웨이는 정확한 `/metrics/job/X` 형식을 요구. |
+| Pushgateway 에는 값이 보이는데 Prometheus 에 안 나옴 | Prometheus `prometheus.yml` 의 `scrape_configs` 에 pushgateway job 이 등록돼 있고 `honor_labels: true` 인지 확인. |
+| 빌드는 되는데 부트 후 멈춤 | WiFi 연결이 매우 느릴 때 발생 가능. `setupWiFi` 가 블로킹 호출 — SSID 가 잘못된 환경에 던지면 안 됨. |
+
+## 8. 보안 / 비밀 관리
+
+- WiFi 패스프레이즈와 PUSH_URL 은 **소스 트리에 커밋되지 않는다** (Makefile
+  변수만 노출). 빌드 시 `-X main.password=...` 로 들어가 펌웨어 바이너리
+  안에는 평문으로 남는다. 보드를 외부에 배포한다면 이 점을 인지할 것.
+- 게이트웨이가 인증을 요구하지 않는 사내 LAN 사용을 전제로 했다. 외부 망에
+  노출된 게이트웨이라면 reverse proxy + basic auth 를 앞에 두는 것이 안전.

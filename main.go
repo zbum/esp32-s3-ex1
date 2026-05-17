@@ -1,6 +1,8 @@
 // Default sketch: cycle the on-board WS2812 through a palette, poll the
-// Sensirion SGP40 VOC sensor over I2C, and mirror every status line to both
-// the USB serial console and a 1.69" 240x280 ST7789V3 TFT.
+// Sensirion SGP40 VOC sensor over I2C, mirror every status line to both the
+// USB serial console and a 1.69" 240x280 ST7789V3 TFT, and (when WiFi
+// credentials are supplied at build time) push each SGP40 raw tick to a
+// Prometheus Pushgateway.
 //
 // Wiring for the ST7789V3 panel (see docs/gpio-pin-mapping.md for the rules
 // behind these choices):
@@ -20,6 +22,15 @@
 //	SCL -> GPIO6   I2C0 clock
 //	VCC -> 3V3
 //	GND -> GND
+//
+// Credentials and Pushgateway target are injected at link time so they
+// never land in source control. Build with:
+//
+//	make flash SSID=... PASSWORD=... PUSH_URL=http://host:9091 \
+//	  PUSH_JOB=esp32-s3-ex1 PUSH_INSTANCE=sgp40
+//
+// Without SSID the WiFi step is skipped and the loop runs locally only.
+// See docs/pushgateway.md for the full pipeline.
 package main
 
 import (
@@ -29,8 +40,13 @@ import (
 	"time"
 
 	"esp32-s3-ex1/internal/console"
+	"esp32-s3-ex1/internal/pushgateway"
 	"esp32-s3-ex1/internal/sgp40"
 	"esp32-s3-ex1/internal/ws2812"
+
+	"tinygo.org/x/drivers/netdev"
+	nl "tinygo.org/x/drivers/netlink"
+	espnl "tinygo.org/x/espradio/netlink"
 
 	"tinygo.org/x/drivers/st7789"
 	"tinygo.org/x/tinyfont/freemono"
@@ -67,9 +83,21 @@ const (
 	charAdvance = 11
 )
 
+// ldflags-injected credentials and Pushgateway target. Defaults make local
+// builds work without WiFi — pushURL stays empty unless overridden so the
+// pusher is treated as disabled.
 var (
-	term *console.Console
-	voc  *sgp40.Device
+	ssid         string
+	password     string
+	pushURL      string
+	pushJob      = "esp32-s3-ex1"
+	pushInstance = "sgp40"
+)
+
+var (
+	term   *console.Console
+	voc    *sgp40.Device
+	pusher *pushgateway.Pusher
 )
 
 // say prints to USB serial via println and mirrors the same string to the
@@ -144,6 +172,45 @@ func setupSGP40() {
 	}
 }
 
+// setupWiFi brings up the ESP32-S3 native radio via espradio's netlink
+// implementation and binds it as the default netdev for net/http. Skipped
+// when no SSID was injected at build time so the board still works as a
+// standalone display + sensor.
+func setupWiFi() {
+	if ssid == "" {
+		say("wifi: skipped (no SSID at build time)")
+		return
+	}
+	link := &espnl.Esplink{}
+	netdev.UseNetdev(link)
+
+	say("wifi: connecting to " + ssid)
+	if err := link.NetConnect(&nl.ConnectParams{
+		Ssid:       ssid,
+		Passphrase: password,
+	}); err != nil {
+		say("wifi err: " + err.Error())
+		return
+	}
+	if addr, err := link.GetHardwareAddr(); err == nil {
+		say("wifi mac: " + addr.String())
+	}
+	say("wifi: connected")
+}
+
+// setupPusher builds the full Pushgateway URL once and keeps a Pusher in
+// the package var when WiFi + pushURL are usable. A nil pusher disables
+// every Push call downstream so the rest of the loop stays unconditional.
+func setupPusher() {
+	if pushURL == "" {
+		say("push: disabled (no PUSH_URL)")
+		return
+	}
+	full := pushURL + "/metrics/job/" + pushJob + "/instance/" + pushInstance
+	pusher = pushgateway.New(full)
+	say("push: " + full)
+}
+
 func main() {
 	time.Sleep(2 * time.Second)
 
@@ -151,6 +218,8 @@ func main() {
 	say("ST7789V3 + WS2812 + SGP40")
 	say("-------------------------")
 	setupSGP40()
+	setupWiFi()
+	setupPusher()
 
 	if freq, err := machine.GetCPUFrequency(); err != nil {
 		say("cpu freq err: " + err.Error())
@@ -192,7 +261,13 @@ func main() {
 			if raw, err := voc.MeasureRaw(); err != nil {
 				say("voc err: " + err.Error())
 			} else {
-				say("voc raw: " + strconv.FormatUint(uint64(raw), 10))
+				rawStr := strconv.FormatUint(uint64(raw), 10)
+				say("voc raw: " + rawStr)
+				if pusher != nil {
+					if err := pusher.Push("sgp40_voc_raw " + rawStr); err != nil {
+						say("push err: " + err.Error())
+					}
+				}
 			}
 		}
 		time.Sleep(500 * time.Millisecond)
