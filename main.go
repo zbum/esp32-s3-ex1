@@ -1,7 +1,8 @@
-// Default sketch: poll the Sensirion SGP40 VOC sensor over I2C, mirror
-// every status line to both the USB serial console and a 1.69" 240x280
-// ST7789V3 TFT, and (when WiFi credentials are supplied at build time)
-// push each SGP40 raw tick to a Prometheus Pushgateway.
+// Default sketch: poll the Sensirion SGP40 VOC sensor and the ASAIR AHT10
+// temperature + humidity sensor over a shared I2C bus, mirror every status
+// line to both the USB serial console and a 1.69" 240x280 ST7789V3 TFT, and
+// (when WiFi credentials are supplied at build time) push the latest sample
+// of all three signals to a Prometheus Pushgateway in one POST.
 //
 // The on-board WS2812 RGB LED is wired up but left dark by default — its
 // bit-banged protocol fights with WiFi IRQs and tends to latch onto a
@@ -20,10 +21,12 @@
 //	VCC -> 3V3
 //	GND -> GND
 //
-// Wiring for the SGP40 breakout (see docs/sgp40-wiring.md):
+// Wiring for the SGP40 + AHT10 breakouts (see docs/sgp40-wiring.md and
+// docs/aht10-wiring.md). Both sensors live on the same I2C0 bus — distinct
+// addresses (SGP40=0x59, AHT10=0x38) keep them from colliding.
 //
-//	SDA -> GPIO5   I2C0 data
-//	SCL -> GPIO6   I2C0 clock
+//	SDA -> GPIO5   I2C0 data  (shared)
+//	SCL -> GPIO6   I2C0 clock (shared)
 //	VCC -> 3V3
 //	GND -> GND
 //
@@ -43,6 +46,7 @@ import (
 	"strconv"
 	"time"
 
+	"esp32-s3-ex1/internal/aht10"
 	"esp32-s3-ex1/internal/console"
 	"esp32-s3-ex1/internal/pushgateway"
 	"esp32-s3-ex1/internal/sgp40"
@@ -108,6 +112,7 @@ var (
 var (
 	term   *console.Console
 	voc    *sgp40.Device
+	rh     *aht10.Device
 	pusher *pushgateway.Pusher
 
 	ledStrip   *ws2812.Device
@@ -197,6 +202,9 @@ func setupDisplay() {
 	term = t
 }
 
+// setupSGP40 also brings up the shared I2C0 bus (GPIO5/6). AHT10 sits on
+// the same bus at a different address, so setupAHT10 can run afterwards
+// without touching the bus config.
 func setupSGP40() {
 	if err := machine.I2C0.Configure(machine.I2CConfig{
 		Frequency: i2cFreqHz,
@@ -219,6 +227,19 @@ func setupSGP40() {
 	} else {
 		say("sgp40 serial: " + strconv.FormatUint(sn, 16))
 	}
+}
+
+// setupAHT10 attaches the ASAIR AHT10 temperature/humidity sensor on the
+// same I2C0 bus already brought up by setupSGP40. A nil rh disables the
+// AHT10 readout downstream so SGP40-only builds keep working.
+func setupAHT10() {
+	dev := aht10.New(machine.I2C0)
+	if err := dev.Configure(); err != nil {
+		say("aht10 init err: " + err.Error())
+		return
+	}
+	rh = dev
+	say("aht10: ready")
 }
 
 // setupLED initializes the on-board WS2812 and drives several all-zero
@@ -326,13 +347,83 @@ func setupPusher() {
 	say("push: " + full)
 }
 
+// fmtF is a small helper for formatting a float32 with a fixed precision —
+// strconv.FormatFloat with these args otherwise gets repeated several times
+// in the metric body.
+func fmtF(v float32, prec int) string {
+	return strconv.FormatFloat(float64(v), 'f', prec, 32)
+}
+
+// sampleAndMaybePush runs one measurement cycle: AHT10 first (so its T/RH
+// can compensate the SGP40 measurement), then SGP40. Console + TFT always
+// see the latest values. On every pushIntervalTicks-th invocation the
+// collected metrics are concatenated into a single Pushgateway POST body,
+// which keeps the lneto TCP socket pool from being hammered.
+//
+// Partial-sensor configurations stay valid: if either rh or voc is nil the
+// corresponding metric lines are simply omitted from the body, and SGP40
+// falls back to the datasheet's default 50%RH / 25°C compensation.
+func sampleAndMaybePush(i int) {
+	var (
+		haveTH        bool
+		tempC, humPct float32
+		haveVOC       bool
+		vocRaw        uint16
+	)
+
+	if rh != nil {
+		t, h, err := rh.Measure()
+		if err != nil {
+			say("aht10 err: " + err.Error())
+		} else {
+			tempC, humPct, haveTH = t, h, true
+			say("temp: " + fmtF(tempC, 1) + "C  rh: " + fmtF(humPct, 1) + "%")
+		}
+	}
+
+	if voc != nil {
+		compT, compRH := float32(25), float32(50)
+		if haveTH {
+			compT, compRH = tempC, humPct
+		}
+		raw, err := voc.MeasureRawCompensated(compRH, compT)
+		if err != nil {
+			say("voc err: " + err.Error())
+		} else {
+			vocRaw, haveVOC = raw, true
+			say("voc raw: " + strconv.FormatUint(uint64(raw), 10))
+		}
+	}
+
+	if pusher == nil || i%pushIntervalTicks != 0 {
+		return
+	}
+	body := ""
+	if haveTH {
+		body += "aht10_temperature_celsius " + fmtF(tempC, 2) + "\n"
+		body += "aht10_humidity_percent " + fmtF(humPct, 2) + "\n"
+	}
+	if haveVOC {
+		body += "sgp40_voc_raw " + strconv.FormatUint(uint64(vocRaw), 10) + "\n"
+	}
+	if body == "" {
+		return
+	}
+	if err := pusher.Push(body); err != nil {
+		sayColor("push err: "+err.Error(), colorPushErr)
+	} else {
+		sayColor("pushed @ i="+strconv.Itoa(i), colorPushOK)
+	}
+}
+
 func main() {
 	time.Sleep(2 * time.Second)
 
 	setupDisplay()
-	say("ST7789V3 + WS2812 + SGP40")
-	say("-------------------------")
+	say("ST7789V3 + WS2812 + SGP40 + AHT10")
+	say("---------------------------------")
 	setupSGP40()
+	setupAHT10()
 	setupLED()
 	setupWiFi()
 	setupPusher()
@@ -345,28 +436,16 @@ func main() {
 
 	for i := 0; ; i++ {
 		cycleLED(i)
-		// Poll the SGP40 once per second (every other palette tick) — the
-		// sensor's gas-index calibration assumes 1 Hz sampling.
+		// Poll both sensors once per second (every other palette tick) — the
+		// SGP40 gas-index calibration assumes 1 Hz sampling and AHT10 is
+		// happy at the same cadence.
 		//
-		// Pushgateway POSTs are gated to once per ~15 s independently of the
-		// sensor read. The lneto net stack has a small TCP socket pool and
-		// one-shot http.Post leaves each connection in TIME_WAIT for tens of
-		// seconds, so a 1 Hz push exhausts the pool ("resource exhausted")
-		// within a handful of iterations.
-		if voc != nil && i%2 == 0 {
-			if raw, err := voc.MeasureRaw(); err != nil {
-				say("voc err: " + err.Error())
-			} else {
-				rawStr := strconv.FormatUint(uint64(raw), 10)
-				say("voc raw: " + rawStr)
-				if pusher != nil && i%pushIntervalTicks == 0 {
-					if err := pusher.Push("sgp40_voc_raw " + rawStr); err != nil {
-						sayColor("push err: "+err.Error(), colorPushErr)
-					} else {
-						sayColor("pushed @ i="+strconv.Itoa(i), colorPushOK)
-					}
-				}
-			}
+		// Pushgateway POSTs are gated to once per pushIntervalTicks. The
+		// lneto net stack has a small TCP socket pool and each connection
+		// sits in TIME_WAIT for tens of seconds, so a 1 Hz push exhausts the
+		// pool ("resource exhausted") within a handful of iterations.
+		if i%2 == 0 {
+			sampleAndMaybePush(i)
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
