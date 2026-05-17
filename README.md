@@ -110,3 +110,11 @@ make flash PORT=/dev/cu.usbmodemXXXX \
   SSID=YOUR_SSID PASSWORD=YOUR_PW \
   SERVER_URL=http://192.168.0.10:8080/sensor
 ```
+
+기본 `main.go` 는 WS2812 팔레트 사이클과 1.69" 240x280 ST7789V3 콘솔
+출력을 함께 동작시킨다. `println` 으로 찍는 로그가 USB 시리얼과 ST7789
+화면 양쪽에 동시에 표시된다. 결선·API 는 [docs/st7789-console.md](docs/st7789-console.md)
+참고.
+
+새 페리페럴에 GPIO 를 할당하기 전에는 [docs/gpio-pin-mapping.md](docs/gpio-pin-mapping.md)
+의 금지 핀 / 안전 핀 목록과 매핑 절차를 먼저 확인한다.

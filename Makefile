@@ -26,7 +26,7 @@ endif
 
 help:
 	@echo "Targets:"
-	@echo "  build     - compile firmware to $(OUT)"
+	@echo "  build     - compile firmware (WS2812 + ST7789V3 console) to $(OUT)"
 	@echo "  flash     - flash firmware to board on $(PORT)"
 	@echo "  monitor   - open serial monitor on $(PORT)"
 	@echo "  all       - build, flash, then monitor"
