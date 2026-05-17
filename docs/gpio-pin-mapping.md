@@ -25,8 +25,8 @@ DHT22, I2C 센서 등)에 GPIO 를 할당할 때 따르는 규칙을 정리한 �
 | 헤더 | GPIO | ADC | Touch | 비고 |
 |------|------|-----|-------|------|
 | 좌측 | 4    | ✓   | ✓     | DHT22 권장 핀(현재 사용) |
-| 좌측 | 5    | ✓   | ✓     | SGP40 + AHT10 공용 SDA(현재 사용) |
-| 좌측 | 6    | ✓   | ✓     | SGP40 + AHT10 공용 SCL(현재 사용) |
+| 좌측 | 5    | ✓   | ✓     | SGP40 + AHT10 SDA, I²C0(현재 사용) |
+| 좌측 | 6    | ✓   | ✓     | SGP40 + AHT10 SCL, I²C0(현재 사용) |
 | 좌측 | 7    | ✓   | ✓     | ST7789 BL(현재 사용) |
 | 좌측 | 8    | ✓   |       | ST7789 RST(현재 사용) |
 | 좌측 | 9    | ✓   | ✓     | ST7789 CS(현재 사용) |
@@ -102,10 +102,10 @@ machine.I2C0.Configure(machine.I2CConfig{
 |            | CS | 9 | chip select |
 |            | RST | 8 | active low |
 |            | BL | 7 | 백라이트 (PWM 가능) |
-| SGP40      | SDA | 5 | I2C0 데이터 (자세한 결선은 [sgp40-wiring.md](sgp40-wiring.md)) |
-|            | SCL | 6 | I2C0 클럭. 풀업 4.7 kΩ (브레이크아웃 내장이면 생략) |
-| AHT10      | SDA | 5 | I2C0 데이터, SGP40 과 버스 공유 (주소 0x38 vs 0x59 충돌 없음). 자세한 결선은 [aht10-wiring.md](aht10-wiring.md) |
-|            | SCL | 6 | I2C0 클럭, 풀업은 버스 전체에 한 쌍만 |
+| SGP40      | SDA | 5 | I²C0 데이터, AHT10 과 버스 공유 (자세한 결선은 [sgp40-wiring.md](sgp40-wiring.md)) |
+|            | SCL | 6 | I²C0 클럭. 풀업 4.7 kΩ (브레이크아웃 내장이면 생략) |
+| AHT10/AHT20 | SDA | 5 | I²C0 데이터, SGP40 과 공유 (주소 0x38 vs 0x59 충돌 없음). 자세한 결선은 [aht10-wiring.md](aht10-wiring.md) |
+|            | SCL | 6 | I²C0 클럭, 풀업은 버스 전체에 한 쌍만. `setupAHT20()` 가 `setupSGP40()` 보다 먼저 호출돼야 init 충돌 없음 |
 
 추가로 센서/버튼을 붙일 때는 이 표에 행을 추가해 주변 핀 충돌이 없게 관리한다.
 
