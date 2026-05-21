@@ -50,6 +50,7 @@ import (
 	"esp32-s3-ex1/internal/console"
 	"esp32-s3-ex1/internal/pushgateway"
 	"esp32-s3-ex1/internal/sgp40"
+	"esp32-s3-ex1/internal/sgp40/vocindex"
 	"esp32-s3-ex1/internal/ws2812"
 
 	"tinygo.org/x/drivers/netdev"
@@ -112,6 +113,7 @@ var (
 var (
 	term   *console.Console
 	voc    *sgp40.Device
+	vocIdx *vocindex.Algorithm
 	rh     *aht10.Device
 	pusher *pushgateway.Pusher
 
@@ -221,6 +223,9 @@ func setupSGP40() {
 		return
 	}
 	voc = dev
+	// Sensirion's Gas Index Algorithm assumes 1 Hz input — the main loop
+	// already polls at that cadence (500 ms tick, every other tick).
+	vocIdx = vocindex.New()
 
 	if sn, err := dev.SerialNumber(); err != nil {
 		say("sgp40 serial err: " + err.Error())
@@ -369,6 +374,11 @@ func sampleAndMaybePush(i int) {
 		tempC, humPct float32
 		haveVOC       bool
 		vocRaw        uint16
+		// The VOC Index is computed on every sample so the estimator sees the
+		// uniform 1 Hz cadence its dynamics assume; haveIdx flips on once the
+		// 45 s initial blackout has elapsed so we don't push a misleading 0.
+		haveIdx bool
+		vocVal  int32
 	)
 
 	if rh != nil {
@@ -391,7 +401,18 @@ func sampleAndMaybePush(i int) {
 			say("voc err: " + err.Error())
 		} else {
 			vocRaw, haveVOC = raw, true
-			say("voc raw: " + strconv.FormatUint(uint64(raw), 10))
+			if vocIdx != nil {
+				vocVal = vocIdx.Process(int32(raw))
+				// Process returns 0 during the 45 s initial blackout — suppress
+				// reporting until the estimator is actually contributing.
+				haveIdx = vocVal > 0
+			}
+			if haveIdx {
+				say("voc raw: " + strconv.FormatUint(uint64(raw), 10) +
+					"  idx: " + strconv.FormatInt(int64(vocVal), 10))
+			} else {
+				say("voc raw: " + strconv.FormatUint(uint64(raw), 10) + "  idx: warming")
+			}
 		}
 	}
 
@@ -405,6 +426,9 @@ func sampleAndMaybePush(i int) {
 	}
 	if haveVOC {
 		body += "sgp40_voc_raw " + strconv.FormatUint(uint64(vocRaw), 10) + "\n"
+	}
+	if haveIdx {
+		body += "sgp40_voc_index " + strconv.FormatInt(int64(vocVal), 10) + "\n"
 	}
 	if body == "" {
 		return
