@@ -53,6 +53,7 @@ import (
 	"esp32-s3-ex1/internal/console"
 	"esp32-s3-ex1/internal/pushgateway"
 	"esp32-s3-ex1/internal/sgp40"
+	"esp32-s3-ex1/internal/sgp40/vocindex"
 	"esp32-s3-ex1/internal/ws2812"
 
 	"tinygo.org/x/drivers/aht20"
@@ -120,6 +121,7 @@ var (
 	disp   *st7789.Device // exposed for direct dashboard rendering
 	rh     *aht20.Device
 	voc    *sgp40.Device
+	vocIdx *vocindex.Algorithm
 	pusher *pushgateway.Pusher
 
 	ledStrip   *ws2812.Device
@@ -321,6 +323,9 @@ func setupSGP40() {
 		return
 	}
 	voc = dev
+	// Sensirion's Gas Index Algorithm assumes 1 Hz input — the main loop
+	// already polls at that cadence (500 ms tick, every other tick).
+	vocIdx = vocindex.New()
 
 	if sn, err := dev.SerialNumber(); err != nil {
 		say("sgp40 serial err: " + err.Error())
@@ -453,6 +458,11 @@ func sampleAndMaybePush(i int) {
 		tempC, humPct float32
 		haveVOC       bool
 		vocRaw        uint16
+		// The VOC Index is computed on every sample so the estimator sees the
+		// uniform 1 Hz cadence its dynamics assume; haveIdx flips on once the
+		// 45 s initial blackout has elapsed so we don't push a misleading 0.
+		haveIdx bool
+		vocVal  int32
 	)
 
 	if rh != nil {
@@ -474,13 +484,28 @@ func sampleAndMaybePush(i int) {
 			say("voc err: " + err.Error())
 		} else {
 			vocRaw, haveVOC = raw, true
-			say("voc raw: " + strconv.FormatUint(uint64(raw), 10))
+			if vocIdx != nil {
+				vocVal = vocIdx.Process(int32(raw))
+				// Process returns 0 during the 45 s initial blackout — suppress
+				// reporting until the estimator is actually contributing.
+				haveIdx = vocVal > 0
+			}
+			if haveIdx {
+				say("voc raw: " + strconv.FormatUint(uint64(raw), 10) +
+					"  idx: " + strconv.FormatInt(int64(vocVal), 10))
+			} else {
+				say("voc raw: " + strconv.FormatUint(uint64(raw), 10) + "  idx: warming")
+			}
 		}
 	}
 
 	drawDashboard(tempC, humPct, vocRaw, haveTH, haveVOC)
 
-	if pusher == nil {
+	// vocIdx.Process must run on every sample (1 Hz) to keep the Sensirion
+	// algorithm's learned dynamics intact; the network push, by contrast, is
+	// rate-limited by the small lneto TCP socket pool — so the two cadences
+	// are split: sampling runs every call, pushing only every pushIntervalTicks.
+	if pusher == nil || i%pushIntervalTicks != 0 {
 		return
 	}
 	body := ""
@@ -490,6 +515,9 @@ func sampleAndMaybePush(i int) {
 	}
 	if haveVOC {
 		body += "sgp40_voc_raw " + strconv.FormatUint(uint64(vocRaw), 10) + "\n"
+	}
+	if haveIdx {
+		body += "sgp40_voc_index " + strconv.FormatInt(int64(vocVal), 10) + "\n"
 	}
 	if body == "" {
 		return
@@ -536,11 +564,12 @@ func main() {
 
 	for i := 0; ; i++ {
 		cycleLED(i)
-		// Sensors + dashboard + push all on the same pushIntervalTicks
-		// cadence — sampling more often than push only burns power and
-		// makes the TFT flicker, since the gas-index algorithm that wants
-		// 1 Hz sampling isn't implemented anyway.
-		if i%pushIntervalTicks == 0 {
+		// Sampling at 1 Hz (every other 500 ms tick) is required by the
+		// Sensirion Gas Index Algorithm to keep its learned baseline /
+		// variance estimator's dynamics correct. The pushgateway POST is
+		// rate-limited separately inside sampleAndMaybePush so the small
+		// lneto TCP socket pool doesn't get exhausted.
+		if i%2 == 0 {
 			sampleAndMaybePush(i)
 		}
 		time.Sleep(500 * time.Millisecond)
