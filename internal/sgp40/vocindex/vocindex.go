@@ -131,6 +131,27 @@ func New() *Algorithm {
 // power-on condition (45 s blackout, neutral baseline).
 func (a *Algorithm) Reset() { a.reset() }
 
+// Uptime returns the number of samples Process has consumed since the last
+// Reset, expressed in seconds (samplingInterval is 1 s). The caller can
+// compare against the 45 s initial blackout to tell "warming up" from
+// "received an out-of-band sraw and held last output."
+func (a *Algorithm) Uptime() float32 { return a.uptime }
+
+// InBlackout reports whether Process is still in the initial 45 s blackout
+// window. Useful for log lines that want to distinguish "warming, this is
+// expected" from "still 0 after warmup, something is off."
+func (a *Algorithm) InBlackout() bool { return a.uptime <= initialBlackout }
+
+// Index returns the most recent internal floating-point index value before
+// rounding. Exposing the unrounded state lets the caller distinguish
+// "algorithm is producing a real value but rounding bit it" from
+// "algorithm output really is ~0".
+func (a *Algorithm) Index() float32 { return a.vocIndex }
+
+// MoxMean returns the learned baseline sraw (post -20000 shift). Exposed
+// only for debug logs — the algorithm advances on its own.
+func (a *Algorithm) MoxMean() float32 { return a.moxSrawMean }
+
 func (a *Algorithm) reset() {
 	a.uptime = 0
 	a.sraw = 0
@@ -162,7 +183,7 @@ func (a *Algorithm) Process(sraw int32) int32 {
 	}
 	if sraw <= 0 || sraw >= 65000 {
 		// Out-of-band sample: keep last output, don't poison the baseline.
-		return int32(roundF(a.vocIndex))
+		return roundUp(a.vocIndex)
 	}
 	if sraw < 20001 {
 		sraw = 20001
@@ -175,13 +196,31 @@ func (a *Algorithm) Process(sraw int32) int32 {
 	a.vocIndex = a.moxProcess(srawF)
 	a.vocIndex = a.sigmoidProcess(a.vocIndex)
 	a.vocIndex = a.lowpassProcess(a.vocIndex)
-	if a.vocIndex < 0.5 {
+	// Combined floor + NaN scrub. The comparison `v < 0.5` is false when
+	// v is NaN (IEEE 754 ordered compares all return false against NaN),
+	// so the previous `if v < 0.5` floor would silently let NaN through —
+	// `int32(NaN)` then collapses to 0 and the reading appears stuck. Use
+	// a positive-equality test so NaN trips the corrective branch.
+	if !(a.vocIndex >= 0.5) {
 		a.vocIndex = 0.5
 	}
 
 	a.mveProcess(srawF, a.vocIndex)
 	a.setMoxParameters(a.mveStd, a.mveMean+a.mveSrawOffset)
-	return int32(roundF(a.vocIndex))
+	return roundUp(a.vocIndex)
+}
+
+// roundUp converts a non-negative float32 to int32 with round-half-away-
+// from-zero. Replaces math.Round in the Process hot path because the
+// stdlib Round goes through float64 conversion and a TinyGo libm shim;
+// for our non-negative output (the 0.5 floor above guarantees v ≥ 0.5)
+// a single `int32(v + 0.5)` matches the upstream C reference exactly and
+// has no library-version sensitivity.
+func roundUp(v float32) int32 {
+	if v <= 0 {
+		return 0
+	}
+	return int32(v + 0.5)
 }
 
 // ---------------- Mean / Variance Estimator -----------------------------
@@ -264,7 +303,16 @@ func (a *Algorithm) mveProcess(sraw, vocIndex float32) {
 		gammaMean *= sigmoid
 		gammaVariance *= sigmoid
 
-		delta := sraw - a.mveMean/mveGammaScaling
+		// Sensirion reference: delta_sgp = (sraw - mean) / GAMMA_SCALING.
+		// The previous port wrote `sraw - a.mveMean/mveGammaScaling`, which
+		// Go's operator precedence parses as `sraw - (mean/64)` — only the
+		// mean got the /64, leaving the effective update gain 64× too high.
+		// With constant input that still decays to zero so unit tests pass,
+		// but with a real fluctuating SGP40 stream the mean blows past the
+		// ±100 absorb threshold in one step and the offset starts
+		// oscillating with a factor of ~−2 per step until the float
+		// overflows to ±Inf and the algorithm collapses to NaN.
+		delta := (sraw - a.mveMean) / mveGammaScaling
 		var deltaVariance float32
 		if delta < 0 {
 			deltaVariance = -delta
