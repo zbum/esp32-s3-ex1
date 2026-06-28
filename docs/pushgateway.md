@@ -1,10 +1,11 @@
 # Prometheus Pushgateway 연동 가이드
 
-ESP32-S3 가 WiFi 로 접속해서 **SGP40 raw VOC tick + AHT10 온도/습도** 를
-Prometheus [Pushgateway](https://github.com/prometheus/pushgateway) 로
-주기적으로 POST 하는 설정. 코드는 모두 `main.go` + `internal/pushgateway/`
-안에 들어 있고, WiFi 자격증명과 게이트웨이 주소는 **빌드 시 ldflags 로
-주입** 한다 (소스 트리에 남기지 않는다).
+ESP32-S3 가 WiFi 로 접속해서 **SGP40 raw VOC tick + 계산된 VOC Index +
+AHT10 온도/습도** 를 Prometheus
+[Pushgateway](https://github.com/prometheus/pushgateway) 로 주기적으로
+POST 하는 설정. 코드는 모두 `main.go` + `internal/pushgateway/` +
+`internal/sgp40/vocindex/` 안에 들어 있고, WiFi 자격증명과 게이트웨이
+주소는 **빌드 시 ldflags 로 주입** 한다 (소스 트리에 남기지 않는다).
 
 ## 1. 데이터 흐름
 
@@ -12,15 +13,21 @@ Prometheus [Pushgateway](https://github.com/prometheus/pushgateway) 로
   SGP40 + AHT10 (I2C0)       ESP32-S3                     Pushgateway
  ──────────────────────  →  ────────────────────────  →  ─────────────
  SGP40 measure_raw_signal    raw TCP POST                /metrics/job/<job>/
- AHT10 measure (T/RH)        (espradio + netlink)         instance/<instance>
-                             body (multi-line):           Prometheus scrape
+ AHT10 measure (T/RH)        Sensirion Gas Index Algo    instance/<instance>
+                             (vocindex pkg, 1 Hz state)   Prometheus scrape
+                             body (multi-line):
                                aht10_temperature_celsius
                                aht10_humidity_percent
                                sgp40_voc_raw
+                               sgp40_voc_index           (100=baseline, 0..500)
 ```
 
 AHT10 의 T/RH 값은 SGP40 의 `MeasureRawCompensated` 보정값으로도 같이
 들어가서, 습도/온도 cross-sensitivity 가 줄어든 raw tick 이 push 된다.
+그 raw tick 을 `internal/sgp40/vocindex` 의 Sensirion Gas Index Algorithm
+포팅이 받아 0..500 VOC Index 로 변환한다. 알고리즘은 1 Hz 고정 샘플링을
+가정하며, 부트 후 **45 초간은 0 (initial blackout)** 을 반환하고 그
+구간 동안은 `sgp40_voc_index` 라인이 body 에 포함되지 않는다.
 
 호스트 측 Prometheus 는 Pushgateway 를 평소처럼 scrape 하면 된다 — 보드가
 오프라인이어도 마지막 push 값이 게이트웨이에 남는다 (게이트웨이가 그렇게
@@ -52,10 +59,12 @@ Body 는 Prometheus text exposition 여러 줄 (한 push 에 묶음):
 aht10_temperature_celsius 23.45
 aht10_humidity_percent 47.12
 sgp40_voc_raw 28664
+sgp40_voc_index 102
 ```
 
 센서 하나가 측정 실패하면 해당 라인은 그냥 빠진다. AHT10 단독, SGP40 단독
-구성도 그대로 동작.
+구성도 그대로 동작. `sgp40_voc_index` 는 부트 후 45 초간(`initial blackout`)
+빠지고, 그 뒤에는 매 push 마다 실린다.
 
 ## 3. 플래시 예시
 
@@ -86,7 +95,9 @@ wifi: connected
 push: http://192.168.0.10:9091/metrics/job/esp32-s3-ex1/instance/sgp40
 ...
 temp: 23.5C  rh: 47.1%
-voc raw: 28664
+voc raw: 28664  idx: warming      # 부트 후 ~45 s 동안
+...
+voc raw: 28612  idx: 102          # 그 뒤
 ```
 
 ## 4. 게이트웨이 측 점검
@@ -94,7 +105,7 @@ voc raw: 28664
 호스트에서 게이트웨이가 받았는지 빠른 확인:
 
 ```bash
-curl -s http://192.168.0.10:9091/metrics | grep -E 'sgp40_voc_raw|aht10_'
+curl -s http://192.168.0.10:9091/metrics | grep -E 'sgp40_|aht10_'
 ```
 
 예상 출력:
@@ -104,6 +115,8 @@ curl -s http://192.168.0.10:9091/metrics | grep -E 'sgp40_voc_raw|aht10_'
 aht10_humidity_percent{instance="sgp40",job="esp32-s3-ex1"} 47.12
 # TYPE aht10_temperature_celsius untyped
 aht10_temperature_celsius{instance="sgp40",job="esp32-s3-ex1"} 23.45
+# TYPE sgp40_voc_index untyped
+sgp40_voc_index{instance="sgp40",job="esp32-s3-ex1"} 102
 # TYPE sgp40_voc_raw untyped
 sgp40_voc_raw{instance="sgp40",job="esp32-s3-ex1"} 28664
 ```

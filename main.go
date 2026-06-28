@@ -53,6 +53,7 @@ import (
 	"esp32-s3-ex1/internal/console"
 	"esp32-s3-ex1/internal/pushgateway"
 	"esp32-s3-ex1/internal/sgp40"
+	"esp32-s3-ex1/internal/sgp40/vocindex"
 	"esp32-s3-ex1/internal/ws2812"
 
 	"tinygo.org/x/drivers/aht20"
@@ -61,6 +62,7 @@ import (
 	nl "tinygo.org/x/drivers/netlink"
 	espnl "tinygo.org/x/espradio/netlink"
 
+	"tinygo.org/x/drivers/pixel"
 	"tinygo.org/x/drivers/st7789"
 	"tinygo.org/x/tinyfont"
 	"tinygo.org/x/tinyfont/freemono"
@@ -120,10 +122,11 @@ var (
 	disp   *st7789.Device // exposed for direct dashboard rendering
 	rh     *aht20.Device
 	voc    *sgp40.Device
+	vocIdx *vocindex.Algorithm
 	pusher *pushgateway.Pusher
 
-	ledStrip   *ws2812.Device
-	ledPixels  []color.RGBA
+	ledStrip  *ws2812.Device
+	ledPixels []color.RGBA
 	// The on-board WS2812 is bit-banged with sub-microsecond pulse widths;
 	// WiFi IRQs corrupt those frames and the LED latches onto the last
 	// garbled value (in this project, green). Default to off; flip via
@@ -211,9 +214,9 @@ func setupDisplay() {
 }
 
 // Dashboard rendering — once the loop starts, the TFT shows a static
-// three-line readout (T / H / V) updated in place instead of the scrolling
-// boot console. Three rows × dashLineH = 120 px; panelHeight = 280 px;
-// dashY0 = 95 centers the block vertically with ~80 px top/bottom margin.
+// four-line readout (T / H / V / I) updated in place instead of the scrolling
+// boot console. Four rows × dashLineH = 160 px; panelHeight = 280 px;
+// dashY0 = 95 places the block with ~75 px top and ~45 px bottom margin.
 var (
 	dashFont  = &freemono.Bold18pt7b
 	dashBG    = color.RGBA{R: 0, G: 0, B: 0, A: 255}
@@ -242,6 +245,80 @@ func vocColor(raw uint16) color.RGBA {
 	}
 }
 
+// vocIndexColor maps the Sensirion VOC Index (0..500, 100 = baseline) to a
+// 3-tier color. Sensirion's own guidance starts suggesting ventilation
+// around 200, so the FAIR band sits just above that to give a small
+// hysteresis margin before the row turns red.
+func vocIndexColor(idx int32) color.RGBA {
+	switch {
+	case idx <= 150:
+		return colorVOC1
+	case idx <= 250:
+		return colorVOC2
+	default:
+		return colorVOC3
+	}
+}
+
+// vocIndexLabel returns the short ASCII status tag shown next to the index.
+// The dashboard font (freemono Bold18pt7b) is ASCII-only, so Korean glyphs
+// would need a font asset we don't ship — keep these to 3–4 chars to fit
+// alongside the numeric value inside the 240 px row.
+func vocIndexLabel(idx int32) string {
+	switch {
+	case idx <= 150:
+		return "GOOD"
+	case idx <= 250:
+		return "FAIR"
+	default:
+		return "BAD"
+	}
+}
+
+// rowBuf is the single off-screen row image shared by all four dashboard
+// rows. We render each row's background + glyphs into this RAM buffer and
+// then ship it to the panel in one DrawBitmap SPI burst, which removes the
+// visible "FillRectangle → empty black → glyphs slowly drawn" flash the
+// previous code produced once per row update.
+//
+// Memory cost: panelWidth(240) × dashLineH(40) × 2 bytes (RGB565) ≈ 19 KB.
+// Plenty of headroom on the ESP32-S3's internal SRAM.
+var (
+	rowBuf      pixel.Image[pixel.RGB565BE]
+	rowBufReady bool
+
+	// lastRowText caches each row's last-rendered string. drawDashboard
+	// skips the DrawBitmap entirely when the row text is unchanged — so
+	// at 0.1 Hz refresh on relatively stable readings (e.g. T didn't move
+	// 0.1 °C between ticks) the corresponding row stays untouched.
+	lastRowText [4]string
+)
+
+// rowCanvas adapts the RAM-resident rowBuf to the tinyfont.Displayer
+// interface. WriteLine writes glyph pixels via SetPixel into our buffer
+// instead of the live panel; the buffer is then blitted in one shot.
+type rowCanvas struct{}
+
+func (rowCanvas) Size() (int16, int16) { return panelWidth, dashLineH }
+func (rowCanvas) SetPixel(x, y int16, c color.RGBA) {
+	if x < 0 || y < 0 || x >= panelWidth || y >= dashLineH {
+		return
+	}
+	rowBuf.Set(int(x), int(y), pixel.NewColor[pixel.RGB565BE](c.R, c.G, c.B))
+}
+func (rowCanvas) Display() error { return nil }
+
+// ensureRowBuf lazy-allocates the shared row image. It runs once on the
+// first dashboard refresh — putting it in switchToDashboard would force
+// the allocation even when the panel never came up.
+func ensureRowBuf() {
+	if rowBufReady {
+		return
+	}
+	rowBuf = pixel.NewImage[pixel.RGB565BE](int(panelWidth), int(dashLineH))
+	rowBufReady = true
+}
+
 // switchToDashboard clears the visible panel and detaches the console so
 // say() / sayColor() only emit to the serial port from this point on.
 func switchToDashboard() {
@@ -249,23 +326,46 @@ func switchToDashboard() {
 		return
 	}
 	disp.FillRectangle(0, panelRowOffset, panelWidth, panelHeight, dashBG)
+	// Force every row to redraw on the next drawDashboard — last-render
+	// cache must not falsely report "already drawn" for a freshly black
+	// panel.
+	for i := range lastRowText {
+		lastRowText[i] = ""
+	}
 	term = nil
 }
 
 // drawDashboard renders the current readings in place. Each row is cleared
 // to background first so old digits don't bleed through when a value
 // shortens (e.g. 30000 → 9999).
-func drawDashboard(tempC, humPct float32, vocRaw uint16, haveTH, haveVOC bool) {
+func drawDashboard(tempC, humPct float32, vocRaw uint16, vocVal int32, haveTH, haveVOC, haveIdx bool) {
 	if disp == nil {
 		return
 	}
+	ensureRowBuf()
+	// Precompute the RGB565 representation of the row background so
+	// FillSolidColor can run as a single tight loop over the underlying
+	// byte buffer instead of per-pixel SetPixel.
+	bgPx := pixel.NewColor[pixel.RGB565BE](dashBG.R, dashBG.G, dashBG.B)
+	// Glyph baseline lives inside the row buffer at this y. Mirrors the
+	// previous on-panel layout (baseY-dashLineH+8 was the rect top), so
+	// row 0's baseline maps to dashLineH-8 inside the buffer.
+	baseInBuf := dashLineH - 8
 	row := func(idx int16, text string, fg color.RGBA) {
-		baseY := panelRowOffset + dashY0 + idx*dashLineH
-		disp.FillRectangle(0, baseY-dashLineH+8, panelWidth, dashLineH, dashBG)
-		tinyfont.WriteLine(disp, dashFont, dashX, baseY, text, fg)
+		if lastRowText[idx] == text {
+			return // unchanged — skip the SPI burst entirely
+		}
+		lastRowText[idx] = text
+		rowBuf.FillSolidColor(bgPx)
+		tinyfont.WriteLine(rowCanvas{}, dashFont, dashX, baseInBuf, text, fg)
+		// Ship the whole row in one transaction so the panel never shows
+		// the intermediate "all-black" state — the row content is replaced
+		// in a single SPI sweep.
+		topY := panelRowOffset + dashY0 - dashLineH + 8 + idx*dashLineH
+		_ = disp.DrawBitmap(0, topY, rowBuf)
 	}
-	tStr, hStr, vStr := "--.- C", "--.- %", "-----"
-	tFG, hFG, vFG := colorNA, colorNA, colorNA
+	tStr, hStr, vStr, iStr := "--.- C", "--.- %", "-----", "--- WARM"
+	tFG, hFG, vFG, iFG := colorNA, colorNA, colorNA, colorNA
 	if haveTH {
 		tStr = fmtF(tempC, 1) + " C"
 		hStr = fmtF(humPct, 1) + " %"
@@ -275,9 +375,14 @@ func drawDashboard(tempC, humPct float32, vocRaw uint16, haveTH, haveVOC bool) {
 		vStr = strconv.FormatUint(uint64(vocRaw), 10)
 		vFG = vocColor(vocRaw)
 	}
+	if haveIdx {
+		iStr = strconv.FormatInt(int64(vocVal), 10) + " " + vocIndexLabel(vocVal)
+		iFG = vocIndexColor(vocVal)
+	}
 	row(0, "T "+tStr, tFG)
 	row(1, "H "+hStr, hFG)
 	row(2, "V "+vStr, vFG)
+	row(3, "I "+iStr, iFG)
 }
 
 // setupAHT20 attaches the ASAIR AHT20 on I²C0 using the TinyGo stock
@@ -321,6 +426,9 @@ func setupSGP40() {
 		return
 	}
 	voc = dev
+	// Sensirion's Gas Index Algorithm assumes 1 Hz input — the main loop
+	// already polls at that cadence (500 ms tick, every other tick).
+	vocIdx = vocindex.New()
 
 	if sn, err := dev.SerialNumber(); err != nil {
 		say("sgp40 serial err: " + err.Error())
@@ -441,6 +549,28 @@ func fmtF(v float32, prec int) string {
 	return strconv.FormatFloat(float64(v), 'f', prec, 32)
 }
 
+// sgp40Compensation returns the humidity / temperature pair that should be
+// fed into MeasureRawCompensated. When the T/RH sensor has not produced a
+// valid reading yet, it falls back to the SGP40 default 50 %RH / 25 °C.
+// When values are present, they are clamped to the datasheet range so we
+// never hand the driver an out-of-range compensation value.
+func sgp40Compensation(tempC, humPct float32, haveTH bool) (float32, float32) {
+	if !haveTH {
+		return 25.0, 50.0
+	}
+	if tempC < -45.0 {
+		tempC = -45.0
+	} else if tempC > 130.0 {
+		tempC = 130.0
+	}
+	if humPct < 0.0 {
+		humPct = 0.0
+	} else if humPct > 100.0 {
+		humPct = 100.0
+	}
+	return tempC, humPct
+}
+
 // sampleAndMaybePush runs one measurement cycle: AHT20 first (so its T/RH
 // can compensate the SGP40 measurement), then SGP40. Console + TFT always
 // see the latest values. On every pushIntervalTicks-th invocation the
@@ -453,6 +583,11 @@ func sampleAndMaybePush(i int) {
 		tempC, humPct float32
 		haveVOC       bool
 		vocRaw        uint16
+		// The VOC Index is computed on every sample so the estimator sees the
+		// uniform 1 Hz cadence its dynamics assume; haveIdx flips on once the
+		// 45 s initial blackout has elapsed so we don't push a misleading 0.
+		haveIdx bool
+		vocVal  int32
 	)
 
 	if rh != nil {
@@ -465,22 +600,57 @@ func sampleAndMaybePush(i int) {
 	}
 
 	if voc != nil {
-		compT, compRH := float32(25), float32(50)
-		if haveTH {
-			compT, compRH = tempC, humPct
-		}
+		compT, compRH := sgp40Compensation(tempC, humPct, haveTH)
 		raw, err := voc.MeasureRawCompensated(compRH, compT)
 		if err != nil {
 			say("voc err: " + err.Error())
 		} else {
 			vocRaw, haveVOC = raw, true
-			say("voc raw: " + strconv.FormatUint(uint64(raw), 10))
+			// Capture the blackout flag BEFORE Process advances the internal
+			// uptime — otherwise the sample that exits blackout returns 0 yet
+			// InBlackout() already reads false, which would mis-tag it as oob.
+			wasBlackout := vocIdx != nil && vocIdx.InBlackout()
+			if vocIdx != nil {
+				vocVal = vocIdx.Process(int32(raw))
+			}
+			rawStr := strconv.FormatUint(uint64(raw), 10)
+			switch {
+			case vocIdx == nil:
+				say("voc raw: " + rawStr + "  voc index: (disabled)")
+			case wasBlackout:
+				// Sensirion blackout: 45 calls return 0. Show samples
+				// remaining so the user sees the countdown, not a frozen log.
+				left := 45 - int32(vocIdx.Uptime())
+				if left < 0 {
+					left = 0
+				}
+				say("voc raw: " + rawStr +
+					"  voc index: warming (" + strconv.FormatInt(int64(left), 10) + "s left)")
+			case vocVal > 0:
+				haveIdx = true
+				say("voc raw: " + rawStr +
+					"  voc index: " + strconv.FormatInt(int64(vocVal), 10))
+			default:
+				// Past blackout but Process still returned 0 — in this
+				// port the only branch that does that is the out-of-band
+				// sraw guard, so flag the sensor as the likely culprit.
+				say("voc raw: " + rawStr + "  voc index: 0 (sraw oob?)")
+			}
 		}
 	}
 
-	drawDashboard(tempC, humPct, vocRaw, haveTH, haveVOC)
+	// Sampling cadence is 1 Hz (Sensirion algorithm dynamics) and the
+	// dashboard rides the same cadence now that the row backbuffer
+	// eliminates the per-row flash — DrawBitmap replaces the row in a
+	// single SPI sweep, and unchanged rows are skipped entirely by the
+	// lastRowText cache, so 1 Hz refresh costs nothing visually.
+	drawDashboard(tempC, humPct, vocRaw, vocVal, haveTH, haveVOC, haveIdx)
 
-	if pusher == nil {
+	// vocIdx.Process must run on every sample (1 Hz) to keep the Sensirion
+	// algorithm's learned dynamics intact; the network push, by contrast, is
+	// rate-limited by the small lneto TCP socket pool — so the two cadences
+	// are split: sampling runs every call, pushing only every pushIntervalTicks.
+	if pusher == nil || i%pushIntervalTicks != 0 {
 		return
 	}
 	body := ""
@@ -490,6 +660,9 @@ func sampleAndMaybePush(i int) {
 	}
 	if haveVOC {
 		body += "sgp40_voc_raw " + strconv.FormatUint(uint64(vocRaw), 10) + "\n"
+	}
+	if haveIdx {
+		body += "sgp40_voc_index " + strconv.FormatInt(int64(vocVal), 10) + "\n"
 	}
 	if body == "" {
 		return
@@ -532,15 +705,16 @@ func main() {
 	// Drop the scrolling boot console; the TFT becomes a static dashboard
 	// from here on. Serial keeps receiving every say() call.
 	switchToDashboard()
-	drawDashboard(0, 0, 0, false, false)
+	drawDashboard(0, 0, 0, 0, false, false, false)
 
 	for i := 0; ; i++ {
 		cycleLED(i)
-		// Sensors + dashboard + push all on the same pushIntervalTicks
-		// cadence — sampling more often than push only burns power and
-		// makes the TFT flicker, since the gas-index algorithm that wants
-		// 1 Hz sampling isn't implemented anyway.
-		if i%pushIntervalTicks == 0 {
+		// Sampling at 1 Hz (every other 500 ms tick) is required by the
+		// Sensirion Gas Index Algorithm to keep its learned baseline /
+		// variance estimator's dynamics correct. The pushgateway POST is
+		// rate-limited separately inside sampleAndMaybePush so the small
+		// lneto TCP socket pool doesn't get exhausted.
+		if i%2 == 0 {
 			sampleAndMaybePush(i)
 		}
 		time.Sleep(500 * time.Millisecond)
