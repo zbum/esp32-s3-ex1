@@ -4,3 +4,5 @@ build/
 .idea/
 .vscode/
 *.iml
+*.swp
+flash.sh

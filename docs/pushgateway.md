@@ -128,9 +128,9 @@ gauge 로 잡고 싶으면 `internal/pushgateway/pushgateway.go` 의 호출부�
 
 ## 5. 코드 구성
 
-- **`internal/pushgateway/pushgateway.go`** — `Pusher{URL}` + `Push(body)` 뿐인
-  얇은 래퍼. `net/http.Post` 위에 trailing newline 처리, 3xx 이상 status 에서
-  에러를 돌려준다.
+- **`internal/pushgateway/pushgateway.go`** — raw TCP 기반의 얇은 HTTP 래퍼.
+  연결과 요청/응답 I/O 전체에 기본 10초 제한 시간을 적용하고, trailing
+  newline 처리 및 3xx 이상 status 에서 에러를 돌려준다.
 - **`main.go::setupWiFi`** — `espradio/netlink.Esplink` 를 `drivers/netdev`
   에 바인딩하고 `NetConnect` 호출. SSID 가 비어 있으면 즉시 리턴.
 - **`main.go::setupPusher`** — `pushURL` + job + instance 를 합쳐 Pusher 를
@@ -166,6 +166,7 @@ gauge 로 잡고 싶으면 `internal/pushgateway/pushgateway.go` 의 호출부�
 | `push err: dial tcp: ...` | `PUSH_URL` 호스트가 보드와 같은 LAN 인지, 방화벽이 9091 열려 있는지. |
 | `push err: status 400` | 보통 body 가 빈 줄로 끝나지 않은 경우. `pushgateway.Push` 가 자동 trailing newline 을 붙이지만 메트릭 이름에 공백이 들어가면 거부됨. |
 | `push err: status 405` | URL 끝의 `job/.../instance/...` 경로 오타. 게이트웨이는 정확한 `/metrics/job/X` 형식을 요구. |
+| `push err: ... i/o timeout` | Pushgateway가 제한 시간 안에 응답을 완료하지 못함. 해당 전송만 실패하며 다음 측정·전송 주기는 계속 실행됨. |
 | Pushgateway 에는 값이 보이는데 Prometheus 에 안 나옴 | Prometheus `prometheus.yml` 의 `scrape_configs` 에 pushgateway job 이 등록돼 있고 `honor_labels: true` 인지 확인. |
 | 빌드는 되는데 부트 후 멈춤 | WiFi 연결이 매우 느릴 때 발생 가능. `setupWiFi` 가 블로킹 호출 — SSID 가 잘못된 환경에 던지면 안 됨. |
 | `SHA-256 comparison failed: ... Attempting to boot anyway...` | **무시.** espradio 가 펌웨어 블롭에 박아두는 정상 부트 메시지(`espradio` README 도 그대로 보여줌). 뒤에 `entry 0x...` → `Connecting to WiFi...` 가 이어지면 정상. |

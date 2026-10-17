@@ -23,12 +23,18 @@ import (
 	"io"
 	"net"
 	"strings"
+	"time"
 )
+
+const defaultTimeout = 10 * time.Second
 
 // Pusher targets a single Pushgateway URL of the form
 // "http://<host>:<port>/metrics/job/<job>/instance/<instance>".
 type Pusher struct {
 	URL string
+	// Timeout bounds both connection setup and all request/response I/O.
+	// Non-positive values use the 10-second default.
+	Timeout time.Duration
 
 	addr string
 	path string
@@ -39,7 +45,7 @@ type Pusher struct {
 // so Push doesn't have to reparse on every call. Returns an empty-URL Pusher
 // if url cannot be split — Push will then return an error on each call.
 func New(url string) *Pusher {
-	p := &Pusher{URL: url}
+	p := &Pusher{URL: url, Timeout: defaultTimeout}
 	if !strings.HasPrefix(url, "http://") {
 		return p
 	}
@@ -73,11 +79,18 @@ func (p *Pusher) Push(body string) error {
 		body += "\n"
 	}
 
-	conn, err := net.Dial("tcp", p.addr)
+	timeout := p.Timeout
+	if timeout <= 0 {
+		timeout = defaultTimeout
+	}
+	conn, err := net.DialTimeout("tcp", p.addr, timeout)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return err
+	}
 
 	w := bufio.NewWriter(conn)
 	fmt.Fprintf(w, "POST %s HTTP/1.1\r\n", p.path)
@@ -100,7 +113,9 @@ func (p *Pusher) Push(body string) error {
 	// Drain the rest of the response so the server can finish its FIN and
 	// our socket can fully close — without this, lneto sometimes keeps the
 	// half-closed socket around long enough to starve subsequent pushes.
-	_, _ = io.Copy(io.Discard, r)
+	if _, err := io.Copy(io.Discard, r); err != nil {
+		return err
+	}
 
 	status = strings.TrimSpace(status)
 	if !strings.HasPrefix(status, "HTTP/1.1 2") && !strings.HasPrefix(status, "HTTP/1.0 2") {
