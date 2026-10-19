@@ -35,10 +35,65 @@ type Pusher struct {
 	// Timeout bounds both connection setup and all request/response I/O.
 	// Non-positive values use the 10-second default.
 	Timeout time.Duration
+	// Trace receives diagnostic stage names immediately before and after
+	// potentially blocking network operations. It may be nil.
+	Trace func(string)
 
 	addr string
 	path string
 	host string
+}
+
+// Async runs at most one Push in a background goroutine. This keeps a broken
+// network dial from blocking sensor sampling on TinyGo targets whose net
+// package does not enforce DialTimeout.
+type Async struct {
+	push    func(string) error
+	result  chan error
+	started time.Time
+}
+
+// NewAsync wraps push with single-flight asynchronous execution.
+func NewAsync(push func(string) error) *Async { return &Async{push: push} }
+
+// Start begins a push unless one is already in flight.
+func (a *Async) Start(body string) bool {
+	if a == nil || a.push == nil || a.result != nil {
+		return false
+	}
+	result := make(chan error, 1)
+	a.result = result
+	a.started = time.Now()
+	go func() {
+		result <- a.push(body)
+	}()
+	return true
+}
+
+// Poll reports a completed push. done is false while idle or still running.
+func (a *Async) Poll() (done bool, err error) {
+	if a == nil || a.result == nil {
+		return false, nil
+	}
+	select {
+	case err := <-a.result:
+		a.result = nil
+		a.started = time.Time{}
+		return true, err
+	default:
+		return false, nil
+	}
+}
+
+// Stalled reports whether the current push has exceeded timeout.
+func (a *Async) Stalled(now time.Time, timeout time.Duration) bool {
+	return a != nil && a.result != nil && timeout > 0 && now.Sub(a.started) >= timeout
+}
+
+func (p *Pusher) trace(stage string) {
+	if p.Trace != nil {
+		p.Trace(stage)
+	}
 }
 
 // New constructs a Pusher and pre-parses the URL into host/path components
@@ -83,14 +138,17 @@ func (p *Pusher) Push(body string) error {
 	if timeout <= 0 {
 		timeout = defaultTimeout
 	}
+	p.trace("dial:start")
 	conn, err := net.DialTimeout("tcp", p.addr, timeout)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
+	p.trace("dial:done")
 	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
 		return err
 	}
+	p.trace("write:start")
 
 	w := bufio.NewWriter(conn)
 	fmt.Fprintf(w, "POST %s HTTP/1.1\r\n", p.path)
@@ -104,22 +162,28 @@ func (p *Pusher) Push(body string) error {
 	if err := w.Flush(); err != nil {
 		return err
 	}
+	p.trace("write:done")
 
 	r := bufio.NewReader(conn)
+	p.trace("status:start")
 	status, err := r.ReadString('\n')
 	if err != nil {
 		return err
 	}
+	p.trace("status:done")
 	// Drain the rest of the response so the server can finish its FIN and
 	// our socket can fully close — without this, lneto sometimes keeps the
 	// half-closed socket around long enough to starve subsequent pushes.
+	p.trace("drain:start")
 	if _, err := io.Copy(io.Discard, r); err != nil {
 		return err
 	}
+	p.trace("drain:done")
 
 	status = strings.TrimSpace(status)
 	if !strings.HasPrefix(status, "HTTP/1.1 2") && !strings.HasPrefix(status, "HTTP/1.0 2") {
 		return fmt.Errorf("pushgateway: %s", status)
 	}
+	p.trace("done")
 	return nil
 }

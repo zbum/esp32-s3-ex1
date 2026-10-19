@@ -1,6 +1,6 @@
 # esp32-s3-ex1
 
-ESP32-S3-N8R2 / N16R8 (44핀 USB-C DevKit, 8MB PSRAM) + TinyGo 예제 프로젝트. 현재 동작 모드: ST7789V3 콘솔 + SGP40(VOC) + AHT10/AHT20(온/습도) 1Hz 측정, WiFi 빌드 시 Prometheus Pushgateway 로 세 메트릭 동시 push.
+ESP32-S3-N8R2 / N16R8 (44핀 USB-C DevKit, 8MB PSRAM) + TinyGo 예제 프로젝트. 현재 동작 모드: ST7789V3 콘솔 + SGP40(VOC) + AHT10/AHT20(온/습도) 1Hz 측정, WiFi 빌드 시 Prometheus Pushgateway 로 네 메트릭 동시 push.
 
 ## Board Overview
 
@@ -122,8 +122,9 @@ TinyGo 빌드 타겟은 `esp32s3-generic`. 이 타겟에는 `D0`, `LED` 같은 �
 - 실내 공기 중 VOC 변화를 감지하는 MOX 기반 가스 센서다.
 - `MeasureRawCompensated()` 로 읽으면 AHT10/AHT20 온도와 습도 값을 함께 넣어
   온습도 보정을 적용할 수 있다.
-- 이 프로젝트의 메인 코드에서는 SGP40 raw tick 을 시리얼과 TFT에 표시하고,
-  필요하면 VOC Index 계산과 Pushgateway 전송에도 사용한다.
+- 이 프로젝트의 메인 코드는 SGP40 raw tick 을
+  `github.com/zbum/sensirion-gas-index-go`로 VOC Index로 변환해 시리얼과
+  TFT에 표시하고, raw tick 및 VOC Index를 Pushgateway로 전송한다.
 - 센서가 내보내는 값은 절대 농도(ppm)가 아니라 raw tick 이므로, 숫자 자체보다
   상대 변화와 추세를 보는 용도에 적합하다.
 

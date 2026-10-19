@@ -125,9 +125,10 @@ setupSGP40()   // SGP40 attach (버스는 이미 idle)
 aht20_temperature_celsius 23.45
 aht20_humidity_percent 47.12
 sgp40_voc_raw 28664
+sgp40_voc_index 102
 ```
 
-Prometheus 측에서는 평소대로 Pushgateway scrape 만 하면 세 메트릭이 같은
+Prometheus 측에서는 평소대로 Pushgateway scrape 만 하면 네 메트릭이 같은
 `job` / `instance` 라벨로 노출된다. 부분 구성(AHT20 만, 또는 SGP40 만)도
 지원 — 측정 실패한 라인은 body 에서 빠진다. 전체 데이터 흐름과 빌드 인자는
 [docs/pushgateway.md](pushgateway.md) 참고.
@@ -138,8 +139,8 @@ Prometheus 측에서는 평소대로 Pushgateway scrape 만 하면 세 메트릭
 2. **플래시 / 모니터**: `make flash` → `make monitor` 로 시리얼 연결.
 3. **부트 로그**:
    - `aht20: ready  temp=23.5C rh=47.1%` — I²C0 init 성공 + 첫 Read 통과.
-   - 60 초마다 `temp:` / `voc raw:` / `pushed @ i=...` 라인이 한 묶음씩
-     출력.
+   - 1초마다 `temp:` / `voc raw:` / `voc index:`가 출력되고, 60초마다
+     `push done`이 출력.
 4. **이상 상황별 점검**:
    - `aht20 read err: i2c: error: expected ACK not NACK` — 모듈이 진짜
      AHT10 silicon 일 수 있음 (init 명령 차이). 한 번에 확신이 안 가면
