@@ -53,13 +53,14 @@ import (
 	"esp32-s3-ex1/internal/console"
 	"esp32-s3-ex1/internal/pushgateway"
 	"esp32-s3-ex1/internal/sgp40"
-	"esp32-s3-ex1/internal/sgp40/vocindex"
 	"esp32-s3-ex1/internal/ws2812"
+	gasindex "github.com/zbum/sensirion-gas-index-go"
 
 	"tinygo.org/x/drivers/aht20"
 
 	"tinygo.org/x/drivers/netdev"
 	nl "tinygo.org/x/drivers/netlink"
+	"tinygo.org/x/espradio"
 	espnl "tinygo.org/x/espradio/netlink"
 
 	"tinygo.org/x/drivers/pixel"
@@ -104,6 +105,9 @@ const (
 	// connection had not yet finished TIME_WAIT inside lneto's small TCP
 	// pool. 60 s gives the previous socket time to fully release.
 	pushIntervalTicks = 120
+	pushStallTimeout  = 15 * time.Second
+	pushResetTimeout  = 3 * time.Minute
+	wifiRetryInterval = 30 * time.Second
 )
 
 // ldflags-injected credentials and Pushgateway target. Defaults make local
@@ -118,12 +122,15 @@ var (
 )
 
 var (
-	term   *console.Console
-	disp   *st7789.Device // exposed for direct dashboard rendering
-	rh     *aht20.Device
-	voc    *sgp40.Device
-	vocIdx *vocindex.Algorithm
-	pusher *pushgateway.Pusher
+	term                *console.Console
+	disp                *st7789.Device // exposed for direct dashboard rendering
+	rh                  *aht20.Device
+	voc                 *sgp40.Device
+	vocIdx              *gasindex.VOC
+	pusher              *pushgateway.Pusher
+	pushAsync           *pushgateway.Async
+	wifiReconnectResult chan error
+	lastWiFiReconnect   time.Time
 
 	ledStrip  *ws2812.Device
 	ledPixels []color.RGBA
@@ -167,6 +174,13 @@ func sayColor(s string, fg color.RGBA) {
 	if term != nil {
 		term.PrintlnColor(s, fg)
 	}
+}
+
+// traceCycle writes serial-only breadcrumbs around every operation that can
+// block the main loop. If the board freezes, the final persisted line tells us
+// which stage was entered but never completed. i is the 500 ms loop counter.
+func traceCycle(i int, stage string) {
+	println("trace cycle", i/2, stage)
 }
 
 var (
@@ -428,7 +442,7 @@ func setupSGP40() {
 	voc = dev
 	// Sensirion's Gas Index Algorithm assumes 1 Hz input — the main loop
 	// already polls at that cadence (500 ms tick, every other tick).
-	vocIdx = vocindex.New()
+	vocIdx = gasindex.NewVOC()
 
 	if sn, err := dev.SerialNumber(); err != nil {
 		say("sgp40 serial err: " + err.Error())
@@ -539,7 +553,64 @@ func setupPusher() {
 	}
 	full := pushURL + "/metrics/job/" + pushJob + "/instance/" + pushInstance
 	pusher = pushgateway.New(full)
+	pusher.Trace = func(stage string) {
+		println("trace push", stage)
+	}
+	pushAsync = pushgateway.NewAsync(pusher.Push)
 	say("push: " + full)
+}
+
+// maintainNetwork harvests asynchronous push results and repairs a Wi-Fi
+// outage without ever blocking sensor sampling. TinyGo 0.42 ignores the
+// timeout passed to net.DialTimeout, so a failed TCP handshake can otherwise
+// remain inside Dial forever.
+func maintainNetwork() {
+	if pushAsync == nil {
+		return
+	}
+	if done, err := pushAsync.Poll(); done {
+		if err != nil {
+			sayColor("push err: "+err.Error(), colorPushErr)
+		} else {
+			sayColor("push done", colorPushOK)
+		}
+	}
+
+	if wifiReconnectResult != nil {
+		select {
+		case err := <-wifiReconnectResult:
+			wifiReconnectResult = nil
+			if err != nil {
+				sayColor("wifi reconnect err: "+err.Error(), colorPushErr)
+			} else {
+				sayColor("wifi reconnected", colorPushOK)
+			}
+		default:
+		}
+	}
+
+	now := time.Now()
+	if pushAsync.Stalled(now, pushResetTimeout) {
+		println("trace push unrecoverable; system restart")
+		sayColor("network recovery failed; restarting", colorPushErr)
+		time.Sleep(250 * time.Millisecond)
+		espRestart()
+		return
+	}
+	if !pushAsync.Stalled(now, pushStallTimeout) || wifiReconnectResult != nil {
+		return
+	}
+	if !lastWiFiReconnect.IsZero() && now.Sub(lastWiFiReconnect) < wifiRetryInterval {
+		return
+	}
+
+	println("trace push stalled; wifi reconnect:start")
+	lastWiFiReconnect = now
+	result := make(chan error, 1)
+	wifiReconnectResult = result
+	go func() {
+		result <- espradio.Connect(espradio.STAConfig{SSID: ssid, Password: password})
+	}()
 }
 
 // fmtF is a small helper for formatting a float32 with a fixed precision —
@@ -578,6 +649,7 @@ func sgp40Compensation(tempC, humPct float32, haveTH bool) (float32, float32) {
 // to keep the lneto TCP socket pool from being hammered. Either sensor
 // being nil only drops its own lines from the body.
 func sampleAndMaybePush(i int) {
+	maintainNetwork()
 	var (
 		haveTH        bool
 		tempC, humPct float32
@@ -589,11 +661,15 @@ func sampleAndMaybePush(i int) {
 		haveIdx bool
 		vocVal  int32
 	)
+	traceCycle(i, "start")
 
 	if rh != nil {
+		traceCycle(i, "aht:read:start")
 		if err := rh.Read(); err != nil {
+			traceCycle(i, "aht:read:error")
 			say("aht20 err: " + err.Error())
 		} else {
+			traceCycle(i, "aht:read:done")
 			tempC, humPct, haveTH = rh.Celsius(), rh.RelHumidity(), true
 			say("temp: " + fmtF(tempC, 1) + "C  rh: " + fmtF(humPct, 1) + "%")
 		}
@@ -601,31 +677,30 @@ func sampleAndMaybePush(i int) {
 
 	if voc != nil {
 		compT, compRH := sgp40Compensation(tempC, humPct, haveTH)
+		traceCycle(i, "sgp:measure:start")
 		raw, err := voc.MeasureRawCompensated(compRH, compT)
 		if err != nil {
+			traceCycle(i, "sgp:measure:error")
 			say("voc err: " + err.Error())
 		} else {
+			traceCycle(i, "sgp:measure:done")
 			vocRaw, haveVOC = raw, true
 			// Capture the blackout flag BEFORE Process advances the internal
 			// uptime — otherwise the sample that exits blackout returns 0 yet
 			// InBlackout() already reads false, which would mis-tag it as oob.
 			wasBlackout := vocIdx != nil && vocIdx.InBlackout()
 			if vocIdx != nil {
+				traceCycle(i, "voc:process:start")
 				vocVal = vocIdx.Process(int32(raw))
+				traceCycle(i, "voc:process:done")
 			}
 			rawStr := strconv.FormatUint(uint64(raw), 10)
 			switch {
 			case vocIdx == nil:
 				say("voc raw: " + rawStr + "  voc index: (disabled)")
 			case wasBlackout:
-				// Sensirion blackout: 45 calls return 0. Show samples
-				// remaining so the user sees the countdown, not a frozen log.
-				left := 45 - int32(vocIdx.Uptime())
-				if left < 0 {
-					left = 0
-				}
-				say("voc raw: " + rawStr +
-					"  voc index: warming (" + strconv.FormatInt(int64(left), 10) + "s left)")
+				// The library suppresses output while its startup estimator warms.
+				say("voc raw: " + rawStr + "  voc index: warming")
 			case vocVal > 0:
 				haveIdx = true
 				say("voc raw: " + rawStr +
@@ -644,13 +719,16 @@ func sampleAndMaybePush(i int) {
 	// eliminates the per-row flash — DrawBitmap replaces the row in a
 	// single SPI sweep, and unchanged rows are skipped entirely by the
 	// lastRowText cache, so 1 Hz refresh costs nothing visually.
+	traceCycle(i, "display:start")
 	drawDashboard(tempC, humPct, vocRaw, vocVal, haveTH, haveVOC, haveIdx)
+	traceCycle(i, "display:done")
 
 	// vocIdx.Process must run on every sample (1 Hz) to keep the Sensirion
 	// algorithm's learned dynamics intact; the network push, by contrast, is
 	// rate-limited by the small lneto TCP socket pool — so the two cadences
 	// are split: sampling runs every call, pushing only every pushIntervalTicks.
 	if pusher == nil || i%pushIntervalTicks != 0 {
+		traceCycle(i, "done")
 		return
 	}
 	body := ""
@@ -665,20 +743,16 @@ func sampleAndMaybePush(i int) {
 		body += "sgp40_voc_index " + strconv.FormatInt(int64(vocVal), 10) + "\n"
 	}
 	if body == "" {
+		traceCycle(i, "done:no-metrics")
 		return
 	}
-	if err := pusher.Push(body); err != nil {
-		sayColor("push err: "+err.Error(), colorPushErr)
-		return
+	if !pushAsync.Start(body) {
+		traceCycle(i, "push:busy")
+		sayColor("push skipped: previous request still running", colorPushErr)
+	} else {
+		traceCycle(i, "push:started")
 	}
-	msg := "pushed @ i=" + strconv.Itoa(i)
-	if haveTH {
-		msg += " T=" + fmtF(tempC, 1) + "C RH=" + fmtF(humPct, 1) + "%"
-	}
-	if haveVOC {
-		msg += " voc=" + strconv.FormatUint(uint64(vocRaw), 10)
-	}
-	sayColor(msg, colorPushOK)
+	traceCycle(i, "done")
 }
 
 func main() {

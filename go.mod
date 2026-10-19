@@ -3,6 +3,7 @@ module esp32-s3-ex1
 go 1.26
 
 require (
+	github.com/zbum/sensirion-gas-index-go v0.0.0-20261018154431-94aacca9a270
 	tinygo.org/x/drivers v0.35.0
 	tinygo.org/x/espradio v0.1.0
 	tinygo.org/x/tinyfont v0.7.0

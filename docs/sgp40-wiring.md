@@ -162,9 +162,9 @@ SGP40 안에는 가열판 위에 얹힌 **금속산화물(MOX) 박막** 이 있�
 2. **자체 베이스라인 + 임계치** — 부팅 후 N분간 평균낸 값을 기준선으로
    삼고, "기준선 대비 X % 이상 하락" 같은 단순 임계치를 호스트에서 직접
    계산. 빠르게 알림(LED, 부저)을 만들 때 유용.
-3. **VOC Index (0–500) 변환** — 사람이 읽을 수 있는 표준 지표가 필요하면
-   §5 의 Sensirion Gas Index Algorithm 을 추가 구현해 SRAW → VOC Index 로
-   매핑한다.
+3. **VOC Index (0–500) 변환** — 현재 펌웨어는 외부 Go module
+   `github.com/zbum/sensirion-gas-index-go`의 Sensirion Gas Index Algorithm으로
+   SRAW → VOC Index를 매핑한다.
 
 ### 빠른 직관 테스트
 
@@ -173,14 +173,15 @@ SGP40 안에는 가열판 위에 얹힌 **금속산화물(MOX) 박막** 이 있�
 을 치우면 다시 천천히 베이스라인으로 돌아온다. 이 동작이 보이면 결선 +
 드라이버 + 측정 흐름이 모두 살아 있다는 가장 확실한 증거다.
 
-## 5. VOC Index (0–500) 변환 — 별도 작업
+## 5. VOC Index (0–500) 변환
 
 `MeasureRaw` 가 돌려주는 16-bit tick 은 **VOC Index 가 아니다**. 사람이
 읽는 0–500 지표로 환산하려면 Sensirion 의 **Gas Index Algorithm** (적응형
-베이스라인 + 시그모이드 매핑) 을 호스트에서 돌려야 한다. 본 드라이버는 raw
-tick 만 노출하므로, 필요하다면 별도 Go 포팅을 `internal/sgp40` 아래에 추가
-한다. 데모용으로는 raw tick 만으로도 공기질 변화 추이(낮을수록 깨끗)를
-관찰할 수 있다.
+베이스라인 + 시그모이드 매핑) 을 호스트에서 돌려야 한다. 센서 드라이버는 raw
+tick 만 노출하고, `main.go`가 외부 `sensirion-gas-index-go` 라이브러리에 이를
+1 Hz로 전달한다. 부팅 직후 45초 initial blackout 뒤부터 VOC Index가 표시되고
+Pushgateway에도 전송된다. raw tick은 VOC가 높을수록 낮아질 수 있지만 VOC
+Index는 반대로 높아진다.
 
 ## 6. 검증 절차
 

@@ -3,9 +3,10 @@
 ESP32-S3 가 WiFi 로 접속해서 **SGP40 raw VOC tick + 계산된 VOC Index +
 AHT10 온도/습도** 를 Prometheus
 [Pushgateway](https://github.com/prometheus/pushgateway) 로 주기적으로
-POST 하는 설정. 코드는 모두 `main.go` + `internal/pushgateway/` +
-`internal/sgp40/vocindex/` 안에 들어 있고, WiFi 자격증명과 게이트웨이
-주소는 **빌드 시 ldflags 로 주입** 한다 (소스 트리에 남기지 않는다).
+POST 하는 설정. 장치 코드는 `main.go` + `internal/pushgateway/`에 있고,
+VOC Index 계산은 외부 Go module `github.com/zbum/sensirion-gas-index-go`를
+사용한다. WiFi 자격증명과 게이트웨이 주소는 **빌드 시 ldflags 로 주입**
+한다 (소스 트리에 남기지 않는다).
 
 ## 1. 데이터 흐름
 
@@ -14,7 +15,7 @@ POST 하는 설정. 코드는 모두 `main.go` + `internal/pushgateway/` +
  ──────────────────────  →  ────────────────────────  →  ─────────────
  SGP40 measure_raw_signal    raw TCP POST                /metrics/job/<job>/
  AHT10 measure (T/RH)        Sensirion Gas Index Algo    instance/<instance>
-                             (vocindex pkg, 1 Hz state)   Prometheus scrape
+                             (gasindex pkg, 1 Hz state)   Prometheus scrape
                              body (multi-line):
                                aht10_temperature_celsius
                                aht10_humidity_percent
@@ -24,10 +25,10 @@ POST 하는 설정. 코드는 모두 `main.go` + `internal/pushgateway/` +
 
 AHT10 의 T/RH 값은 SGP40 의 `MeasureRawCompensated` 보정값으로도 같이
 들어가서, 습도/온도 cross-sensitivity 가 줄어든 raw tick 이 push 된다.
-그 raw tick 을 `internal/sgp40/vocindex` 의 Sensirion Gas Index Algorithm
-포팅이 받아 0..500 VOC Index 로 변환한다. 알고리즘은 1 Hz 고정 샘플링을
-가정하며, 부트 후 **45 초간은 0 (initial blackout)** 을 반환하고 그
-구간 동안은 `sgp40_voc_index` 라인이 body 에 포함되지 않는다.
+그 raw tick 을 `github.com/zbum/sensirion-gas-index-go`의 Sensirion Gas Index
+Algorithm 포팅이 받아 0..500 VOC Index 로 변환한다. 알고리즘은 1 Hz 고정
+샘플링을 가정하며, 부트 후 **45 초간은 0 (initial blackout)** 을 반환하고
+그 구간 동안은 `sgp40_voc_index` 라인이 body 에 포함되지 않는다.
 
 호스트 측 Prometheus 는 Pushgateway 를 평소처럼 scrape 하면 된다 — 보드가
 오프라인이어도 마지막 push 값이 게이트웨이에 남는다 (게이트웨이가 그렇게
@@ -130,16 +131,23 @@ gauge 로 잡고 싶으면 `internal/pushgateway/pushgateway.go` 의 호출부�
 
 - **`internal/pushgateway/pushgateway.go`** — raw TCP 기반의 얇은 HTTP 래퍼.
   연결과 요청/응답 I/O 전체에 기본 10초 제한 시간을 적용하고, trailing
-  newline 처리 및 3xx 이상 status 에서 에러를 돌려준다.
+  newline 처리 및 3xx 이상 status 에서 에러를 돌려준다. 시리얼의
+  `trace push <stage>` 로그는 dial/write/status/drain 중 정지 위치를 보여준다.
+  TinyGo 0.42가 TCP dial timeout을 적용하지 않는 경우에 대비해 push는 센서
+  루프 밖의 goroutine에서 실행한다. 15초 이상 완료되지 않으면 센서와 화면은
+  계속 갱신하면서 Wi-Fi 재연결을 시작하고, 실패 시 30초 간격으로 재시도한다.
+  최초 push 정지 후 3분 동안 회복되지 않으면 ESP32를 재부팅하여 Wi-Fi와 TCP
+  스택을 모두 초기화한다(재부팅 전 약 6회의 재연결 기회).
 - **`main.go::setupWiFi`** — `espradio/netlink.Esplink` 를 `drivers/netdev`
   에 바인딩하고 `NetConnect` 호출. SSID 가 비어 있으면 즉시 리턴.
 - **`main.go::setupPusher`** — `pushURL` + job + instance 를 합쳐 Pusher 를
   생성하고 패키지 변수에 저장.
 - **`main.go::sampleAndMaybePush`** — 매 1초 cycle 의 측정 + 조건부 push.
-  AHT10 → SGP40 순으로 읽고(보정값 전달), pushIntervalTicks 마다 세 메트릭
+  AHT10 → SGP40 순으로 읽고(보정값 전달), pushIntervalTicks 마다 네 메트릭
   라인을 한 body 로 묶어 POST. 한쪽 센서가 빠져도 나머지 라인은 그대로 push.
 - **`main.go::main` 루프** — `cycleLED` + 1Hz `sampleAndMaybePush` 호출만
-  한다. WiFi 가 꺼져 있거나 push 가 실패해도 시리얼/디스플레이는 계속 동작.
+  한다. WiFi 가 꺼져 있거나 push 가 실패해도 시리얼/디스플레이는 계속
+  동작하고, 3분간 복구되지 않으면 네트워크 스택 초기화를 위해 재부팅한다.
 
 ## 6. 인터벌 / 부하
 
